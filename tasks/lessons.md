@@ -14,3 +14,4 @@
 
 - A supported optional provider must not require another provider's CLI. Discover catalogs through bounded metadata-only handshakes, preserve manual and hidden historical routes, and isolate installer tests from real provider binaries and the user's home directory.
 - Validate provider readiness under the background service's credential environment, not shell-only overrides. Carry discovered model capabilities through request execution: an empty effort list must suppress the native effort flag, including Codex's default none.
+- Keep model discovery available as a short command independent of service installation. Hot reload provider executable paths for future turns alongside their routes, preserve active process ownership, and never replace an unrelated command when registering a launcher.

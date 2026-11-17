@@ -5,7 +5,8 @@
   "type": "module",
   "private": true,
   "bin": {
-    "codex-claude-bridge": "src/server.js"
+    "codex-claude-bridge": "src/server.js",
+    "codexbridge": "scripts/codexbridge.js"
   },
   "scripts": {
     "start": "node src/server.js",

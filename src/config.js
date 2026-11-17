@@ -23,9 +23,21 @@ function readUserConfig() {
   }
 }
 
-/** Reads model data again without applying unrelated service settings to active work. */
+/** Reads model routes and executable paths for future turns without restarting active work. */
+export function loadModelRoutes() {
+  const user = readUserConfig();
+  const routes = { models: modelsFromConfig(user) };
+  for (const [provider, key] of [['CLAUDE', 'claudePath'], ['GROK', 'grokPath']]) {
+    const executable = process.env[`CODEX_CLAUDE_BRIDGE_${provider}`] || (user[key] ?? DEFAULTS[key]);
+    if (typeof executable !== 'string' || !executable.trim()) throw new Error(`Expected a non-empty ${key}`);
+    routes[key] = executable;
+  }
+  return routes;
+}
+
+/** Reads the model list using the same validation as live route updates. */
 export function loadModels() {
-  return modelsFromConfig(readUserConfig());
+  return loadModelRoutes().models;
 }
 
 // Reuse Codex's installed computer-use server only when the user enabled that plugin.

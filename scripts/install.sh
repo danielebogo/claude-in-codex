@@ -34,6 +34,7 @@ NODE_MAJOR="$("$NODE" -p 'process.versions.node.split(".")[0]')"
 HAS_ZSTD="$("$NODE" -p 'typeof require("zlib").zstdDecompressSync === "function"')"
 
 say "node: $NODE ($("$NODE" -v))"
+"$NODE" "$DIR/scripts/codexbridge.js" setup "$HOME/.local/bin"
 
 # The bridge inspects each WebSocket message so a GPT-prewarmed side chat can
 # switch to Claude without sending that Claude request to OpenAI.

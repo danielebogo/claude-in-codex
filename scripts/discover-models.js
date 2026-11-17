@@ -155,6 +155,8 @@ export async function prepareInstallation(configFile, port, options = {}) {
     if (error.code !== 'ENOENT') throw new Error('Cannot read bridge config.json; repair its JSON before installing.');
   }
   if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('Expected a bridge configuration object.');
+  const effectivePort = port ?? config.port ?? 18787;
+  if (!Number.isSafeInteger(effectivePort) || effectivePort < 1 || effectivePort > 65535) throw new Error('Bridge config port must be an integer from 1 to 65535.');
   const previous = modelsFromConfig(config);
   const results = await Promise.all(['claude', 'grok'].map(async (provider) => {
     const executable = findExecutable(provider, config, options);
@@ -190,21 +192,26 @@ export async function prepareInstallation(configFile, port, options = {}) {
       }
     }
   }
-  config.port = port;
+  config.port = effectivePort;
   config.models = models;
   modelsFromConfig(config);
   return { config, warnings: results.filter((result) => result.warning).map((result) => result.warning), providers: available.map((result) => ({ provider: result.provider, count: result.models.length, executable: result.executable })) };
 }
 
-async function main() {
-  const [configFile, port, home] = process.argv.slice(2);
-  const result = await prepareInstallation(configFile, Number(port), { home });
+/** Atomically publishes validated discovery data without changing service identity or routes. */
+export function writeModelConfig(configFile, config) {
   fs.mkdirSync(path.dirname(configFile), { recursive: true, mode: 0o700 });
   const temporary = `${configFile}.${process.pid}.tmp`;
   try {
-    fs.writeFileSync(temporary, JSON.stringify(result.config, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
+    fs.writeFileSync(temporary, JSON.stringify(config, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
     fs.renameSync(temporary, configFile);
   } finally { fs.rmSync(temporary, { force: true }); }
+}
+
+async function main() {
+  const [configFile, port, home] = process.argv.slice(2);
+  const result = await prepareInstallation(configFile, Number(port), { home });
+  writeModelConfig(configFile, result.config);
   for (const warning of result.warnings) console.error(warning);
   for (const { provider, count } of result.providers) console.error(`${LABELS[provider]}: discovered ${count} models.`);
   process.stdout.write([...new Set(result.providers.map(({ executable }) => path.dirname(executable)))].join(path.delimiter));

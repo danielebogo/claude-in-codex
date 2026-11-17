@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { Readable } from 'node:stream';
 import { EventEmitter } from 'node:events';
 import WebSocket, { WebSocketServer } from 'ws';
-import { loadConfig, loadModels, BASE_PATH, BRIDGE_HOME } from './config.js';
+import { loadConfig, loadModelRoutes, BASE_PATH, BRIDGE_HOME } from './config.js';
 import { State } from './state.js';
 import { parseCodexRequest, buildClaudeUserMessage, sanitizeInputForOpenAI, makeMarker } from './codexInput.js';
 import { ResponsesStream, usageObject, rid } from './responsesStream.js';
@@ -127,13 +127,14 @@ export function createBridge(initialConfig, state = new State()) {
   const log = makeLogger(config.logLevel);
   const debugDump = config.debugDumpDir ? createDebugDumper(config.debugDumpDir) : null;
   const claudeSlugs = new Map(config.models.map((m) => [m.slug, m]));
-  let modelSnapshot = JSON.stringify(config.models);
+  let modelSnapshot = JSON.stringify({ models: config.models, claudePath: config.claudePath, grokPath: config.grokPath });
   let warnedInvalidModels = false;
   function refreshModels() {
     if (initialConfig) return; // An explicitly supplied embedded/test configuration stays owned by its caller.
     try {
-      const models = loadModels();
-      const snapshot = JSON.stringify(models);
+      const routes = loadModelRoutes();
+      const { models } = routes;
+      const snapshot = JSON.stringify(routes);
       warnedInvalidModels = false;
       if (snapshot === modelSnapshot) return;
       for (const model of models) {
@@ -141,7 +142,7 @@ export function createBridge(initialConfig, state = new State()) {
         if (previous && providerForModel(previous) !== providerForModel(model)) throw new Error('A live model slug cannot change provider. Use a new slug.');
       }
       for (const model of models) claudeSlugs.set(model.slug, model); // Retain removed routes so an existing chat or waiting tool result still reaches Claude.
-      config = { ...config, models }; // Existing native turns keep the configuration object and model they were admitted with.
+      config = { ...config, ...routes }; // Existing native turns keep the configuration object and model they were admitted with.
       modelSnapshot = snapshot;
       log.info(`model catalog reloaded: ${models.map((model) => model.slug).join(', ')}`);
     } catch {

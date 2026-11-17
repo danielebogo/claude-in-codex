@@ -10,7 +10,7 @@ import { once } from 'node:events';
 import WebSocket, { WebSocketServer } from 'ws';
 import { parseMarker } from '../src/codexInput.js';
 
-async function startReloadBridge(t, scenario, config = {}) {
+async function startReloadBridge(t, scenario, config = {}, environment = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ccb reload test '));
   fs.cpSync(new URL('../src', import.meta.url), path.join(directory, 'src'), { recursive: true });
   fs.symlinkSync(new URL('../node_modules', import.meta.url).pathname, path.join(directory, 'node_modules'));
@@ -23,7 +23,7 @@ async function startReloadBridge(t, scenario, config = {}) {
   const fixtureLog = path.join(directory, 'claude.log');
   const releaseFile = path.join(directory, 'release');
   const child = spawn(process.execPath, [path.join(directory, 'src/server.js')], {
-    env: { ...process.env, CODEX_CLAUDE_BRIDGE_HOME: directory, CODEX_CLAUDE_BRIDGE_PORT: String(port), CODEX_CLAUDE_BRIDGE_CLAUDE: new URL('./fixtures/fake-claude.js', import.meta.url).pathname, FAKE_CLAUDE_SCENARIO: scenario, FAKE_CLAUDE_LOG: fixtureLog, FAKE_CLAUDE_HOLD_FILE: releaseFile },
+    env: { ...process.env, CODEX_CLAUDE_BRIDGE_HOME: directory, CODEX_CLAUDE_BRIDGE_PORT: String(port), CODEX_CLAUDE_BRIDGE_CLAUDE: new URL('./fixtures/fake-claude.js', import.meta.url).pathname, FAKE_CLAUDE_SCENARIO: scenario, FAKE_CLAUDE_LOG: fixtureLog, FAKE_CLAUDE_HOLD_FILE: releaseFile, ...environment },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let log = '';
@@ -248,4 +248,35 @@ test('source reload waits for a Grok native turn across a Codex tool handoff', {
   const marker = parseMarker(finished.output.find((item) => item.encrypted_content)?.encrypted_content);
   const saved = JSON.parse(fs.readFileSync(path.join(bridge.directory, 'state.json'), 'utf8'));
   assert.equal(saved.sessions[`grok:${marker.sid}`].threadId, 'grok-reload-owner');
+});
+
+test('adding a provider hot loads its custom CLI path while another native turn keeps running', { timeout: 8000 }, async (t) => {
+  const claude = { slug: 'claude-current', displayName: 'Current', claudeModel: 'claude-opus-5-5' };
+  const bridge = await startReloadBridge(t, 'hold-native', { models: [claude], grokPath: '/missing/grok' });
+  const input = [
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: `<environment_context><cwd>${bridge.directory}</cwd></environment_context>` }] },
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hello' }] },
+  ];
+  const request = (model) => fetch(bridge.url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model, input }) });
+  const response = await request(claude.slug);
+  const reader = response.body.getReader();
+  await reader.read();
+  const deadline = Date.now() + 2000;
+  while (!fs.existsSync(bridge.fixtureLog) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+  const grokPath = path.join(bridge.directory, 'new provider.mjs');
+  fs.copyFileSync(new URL('./fixtures/fake-grok.js', import.meta.url), grokPath);
+  fs.chmodSync(grokPath, 0o755);
+  const grok = { slug: 'grok-added', displayName: 'Added Grok', provider: 'grok', model: 'grok-4.7' };
+  fs.writeFileSync(path.join(bridge.directory, 'config.json'), JSON.stringify({ models: [claude, grok], grokPath }));
+
+  const added = await (await request(grok.slug)).text();
+
+  assert.match(added, /Hello world/);
+  const health = await (await fetch(new URL(`/${bridge.token}/health`, bridge.url))).json();
+  assert.equal(health.diagnostics.pid, bridge.child.pid);
+  assert.equal(health.diagnostics.claude.running, 1, 'the previous Claude process is still running');
+  fs.writeFileSync(bridge.releaseFile, 'finish');
+  let completed = '';
+  for (;;) { const chunk = await reader.read(); if (chunk.done) break; completed += new TextDecoder().decode(chunk.value); }
+  assert.match(completed, /response.completed/);
 });

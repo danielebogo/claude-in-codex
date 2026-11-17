@@ -20,7 +20,7 @@ async function isolatedInstaller(t, health = 'valid', providers = ['claude'], di
   fs.writeFileSync(path.join(directory, 'package.json'), '{"type":"module"}');
   fs.mkdirSync(bin);
   fs.mkdirSync(path.join(home, '.codex'), { recursive: true });
-  for (const name of ['install.sh', 'uninstall.sh', 'configure-route.js', 'bridge-endpoint.js', 'discover-models.js']) {
+  for (const name of ['install.sh', 'uninstall.sh', 'configure-route.js', 'bridge-endpoint.js', 'discover-models.js', 'codexbridge.js']) {
     const source = fs.readFileSync(new URL(`../scripts/${name}`, import.meta.url), 'utf8');
     fs.writeFileSync(path.join(scripts, name), source.replace(/\$HOME\b/g, '$TEST_INSTALLER_HOME')); // Redirect script paths in the test copy without changing HOME or touching the user's service/config.
   }

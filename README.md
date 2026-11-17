@@ -36,7 +36,7 @@ Claude Code does all the work: its own agent loop, tools, CLAUDE.md, skills and 
 git clone https://github.com/danielebogo/claude-in-codex.git && ./claude-in-codex/scripts/install.sh
 ```
 
-Already cloned? Run just `./scripts/install.sh` from the checkout. No model JSON editing or separate Grok setup in the bridge is needed.
+Already cloned? Run `./scripts/install.sh` once from the checkout. Setup registers `codexbridge` in `~/.local/bin`, so subsequent commands work from any directory. No model JSON editing or separate Grok setup in the bridge is needed.
 
 Then **quit Codex completely (Cmd+Q) and reopen it**. Open the model picker: the detected Claude/Grok models are listed after GPT. Pick one and send a message. Provider installation and login are prerequisites; setup reports a missing or logged-out CLI and can continue with another ready provider. If neither is ready, it stops before changing the service or Codex route.
 
@@ -57,13 +57,26 @@ The installer generates a random 256-bit capability in `~/.codex-claude-bridge/l
 
 When upgrading from a version without local authentication, rerun the installer and restart Codex so it loads the private URL. A source-only update rejects the old unauthenticated route. The installer restarts the bridge, so perform that migration when your chats are idle.
 
-**Uninstall:** `./scripts/uninstall.sh` stops the service and removes that line. Restart Codex afterwards.
+### The codexbridge command
+
+| Command | Action |
+|---|---|
+| `codexbridge install` | Install or reinstall the bridge, discover models, and configure Codex. Restarts the service. |
+| `codexbridge add` | Discover new supported provider CLIs and refresh their model catalogs. Keeps the service and active turns running. |
+| `codexbridge uninstall` | Stop the service and restore the original Codex route. Retains the command and bridge settings for a later reinstall. |
+| `codexbridge --help` | Show available commands. |
+
+After installing and signing into Claude Code or Grok, run `codexbridge add`. It also refreshes models added by an existing provider. Codex sees the changes on its next model-catalog refresh. Discovery currently supports Claude Code and Grok; another provider needs its own bridge adapter.
+
+The first installer run registers the command even if a provider still needs login. To register only the command from an existing checkout, run `node scripts/codexbridge.js setup`. If `~/.local/bin` is absent from your PATH, add `export PATH="$HOME/.local/bin:$PATH"` to your shell startup file (usually `~/.zshrc` on macOS) and open a new terminal. The launcher uses this checkout; keep it in place, or rerun setup after moving it.
+
+**Uninstall:** `codexbridge uninstall` (or `./scripts/uninstall.sh`) stops the service and removes the managed route. Restart Codex afterwards.
 
 ### Provider discovery and optional configuration
 
 The bridge can also run Grok Build through its existing Grok login. Install and sign in to the official `grok` CLI separately. No API key is required by this adapter: it requests cached-token authentication and removes `XAI_API_KEY` from the child environment. Access and usage remain governed by your Grok account; a successful login or model listing does not establish your remaining quota.
 
-Rerun `./scripts/install.sh` after installing or signing into another provider, or when you want to refresh the available models. Discovery runs during installation, rather than polling or restarting a running bridge. It preserves unrelated settings, custom routes, custom slugs, and explicit `hidden` flags. Routes added by discovery use `discovered: true`; when no longer listed, they remain routable for existing chats with `discoveryHidden: true`, which hides their picker entry until discovery finds them again. Retired default routes such as Fable 5.1 remain hidden.
+Run `codexbridge add` after installing or signing into another supported provider, or to refresh the available models. Discovery also runs during installation. The add command updates configuration without restarting the running bridge. It preserves unrelated settings, custom routes, custom slugs, and explicit `hidden` flags. Routes added by discovery use `discovered: true`; when no longer listed, they remain routable for existing chats with `discoveryHidden: true`, which hides their picker entry until discovery finds them again. Retired default routes such as Fable 5.1 remain hidden.
 
 Discovery uses Claude's persistent CLI login, ignoring terminal-only authentication and routing overrides that the background service would not inherit. Discovery reads metadata only. It does not send paid model prompts or test your remaining quota. Grok's fast variant appears as a separate choice if the CLI lists it; setup never selects it automatically. Context size and reasoning levels reported by the CLI are carried into the catalog.
 
@@ -80,7 +93,7 @@ You can still edit the `models` array in `~/.codex-claude-bridge/config.json` fo
 
 `models` replaces the source defaults. The installer merges discovery into the effective list without duplicating a provider/model already represented by a manual route. A slug collision with another native model stops installation instead of reassigning that route. A live slug cannot change provider; add another slug and hide the old entry instead.
 
-Use `claudePath` or `grokPath` in that config, or `CODEX_CLAUDE_BRIDGE_CLAUDE` / `CODEX_CLAUDE_BRIDGE_GROK` during installation, for executables in custom locations. Model-data edits hot reload; changing executable paths needs an idle bridge restart. Reinstalling restarts the service, so refresh while chats are idle.
+Use `claudePath` or `grokPath` in that config, or `CODEX_CLAUDE_BRIDGE_CLAUDE` / `CODEX_CLAUDE_BRIDGE_GROK` during installation, for executables in custom locations. Model data and executable paths hot reload for future turns; active turns retain the configuration they started with. Other service settings need an idle restart. Use `codexbridge add` to refresh models; run `codexbridge install` while chats are idle when you need to reinstall the service.
 
 The internal Grok adapter speaks ACP on stdin/stdout, translates its events into the shared native-turn stream, and supplies Codex MCP tools per session. Grok's native permission decisions are handled without interactive prompts; read-only/plan, workspace and full-access requests select the corresponding Grok sandbox profile. Codex-run tools continue through Codex's own approvals. Unknown permission requests are denied. Grok authentication errors stay on the Grok route and never reroute the prompt to Claude or GPT. Housekeeping calls still use GPT.
 
