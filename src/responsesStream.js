@@ -228,12 +228,12 @@ export class ResponsesStream {
   }
 }
 
-export function usageObject({ input = 0, cached = 0, output = 0 } = {}) {
+export function usageObject({ input = 0, cached = 0, output = 0, total } = {}) {
   return {
     input_tokens: input,
     input_tokens_details: { cached_tokens: cached },
     output_tokens: output,
     output_tokens_details: { reasoning_tokens: 0 },
-    total_tokens: input + output,
+    total_tokens: total ?? input + output,
   };
 }

@@ -3,6 +3,48 @@ import assert from 'node:assert/strict';
 import { findCodexResults, waitForCodexResults, forgetCodexCalls, waitingCodexTurnsReferencedBy, waitingCodexTurns } from '../src/codexTools.js';
 import { chatDelivery } from './fixtures/codex-delegation.js';
 
+// Failure modes:
+// - Matching call/thread IDs resume a waiting process from a different provider.
+// - A mailbox delivery bypasses provider checks when a tool result is absent.
+// - Filtering continuations accidentally hides foreign turns from cancellation.
+test('tool results continue only a waiting turn owned by the requested native provider', () => {
+  const claude = { threadId: 'shared-provider-thread' };
+  const grok = { threadId: claude.threadId, provider: 'grok' };
+  const claudeOutput = { type: 'function_call_output', call_id: 'provider-claude', output: 'Claude result' };
+  const grokOutput = { type: 'custom_tool_call_output', call_id: 'provider-grok', output: 'Grok result' };
+  waitForCodexResults([{ callId: claudeOutput.call_id, entry: { name: 'exec' } }], claude, 'ccb:v1:session:turn');
+  waitForCodexResults([{ callId: grokOutput.call_id, entry: { name: 'exec' } }], grok, 'ccb:v2:grok:session:turn');
+  try {
+    assert.equal(findCodexResults([grokOutput], claude.threadId), null);
+    assert.equal(findCodexResults([claudeOutput], claude.threadId, 'grok'), null);
+    assert.equal(findCodexResults([claudeOutput], claude.threadId).turn, claude);
+    assert.equal(findCodexResults([grokOutput], grok.threadId, 'grok').turn, grok);
+    assert.deepEqual([...findCodexResults([claudeOutput, grokOutput], claude.threadId).outputs.keys()], [claudeOutput.call_id]);
+    assert.deepEqual([...findCodexResults([claudeOutput, grokOutput], grok.threadId, 'grok').outputs.keys()], [grokOutput.call_id]);
+    assert.deepEqual(waitingCodexTurns(claude.threadId), [claude, grok]);
+    assert.deepEqual(waitingCodexTurnsReferencedBy([claudeOutput, grokOutput], claude.threadId), [claude, grok]);
+  } finally {
+    forgetCodexCalls([claudeOutput.call_id, grokOutput.call_id]);
+  }
+});
+
+test('mailbox wakeups require the waiting native provider even with a matching call or marker', () => {
+  for (const [provider, foreign] of [['claude', 'grok'], ['grok', 'claude']]) {
+    const turn = { threadId: 'provider-mailbox', provider };
+    const marker = { type: 'reasoning', encrypted_content: provider === 'claude' ? 'ccb:v1:session:mailbox' : 'ccb:v2:grok:session:mailbox' };
+    const call = { type: 'function_call', call_id: 'provider-mailbox-call' };
+    waitForCodexResults([{ callId: call.call_id, entry: { namespace: 'collaboration', name: 'wait_agent' } }], turn, marker.encrypted_content);
+    try {
+      for (const boundary of [marker, call]) {
+        assert.equal(findCodexResults([boundary, chatDelivery], turn.threadId, foreign), null);
+        assert.equal(findCodexResults([boundary, chatDelivery], turn.threadId, provider).turn, turn);
+      }
+    } finally {
+      forgetCodexCalls([call.call_id]);
+    }
+  }
+});
+
 test('a chat delivery survives a later tool marker and is acknowledged only after delivery', () => {
   const turn = { threadId: 'chat-receiver', agentMessageIds: new Set() };
   const marker = { type: 'reasoning', encrypted_content: 'ccb:v1:session:later-call' };

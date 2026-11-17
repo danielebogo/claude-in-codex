@@ -140,10 +140,13 @@ function claudeEnvironment(threadId) {
  * @returns {Promise<void>}
  */
 export async function runClaudeTurn({ config, state, stream, parsed, modelCfg, effort, userMessage, log, req, codexTools }) {
+  const provider = config.nativeProvider ?? 'claude';
+  const label = provider === 'grok' ? 'Grok Build' : 'Claude Code';
+  const providerNote = (text) => provider === 'grok' ? text.replaceAll('Claude Code', 'Grok Build').replaceAll('Claude', 'Grok') : text;
   const caps = await claudeCapabilities(config.claudePath);
   if (!caps.ok) {
     stream.textDelta(
-      `Couldn't start Claude Code (\`${config.claudePath}\`). Check it's installed and logged in (\`claude auth login\`), then set \`claudePath\` in ~/.codex-claude-bridge/config.json if it isn't on PATH.`,
+      `Couldn't start ${label} (\`${provider === 'grok' ? config.grokPath : config.claudePath}\`). Check it's installed and logged in (\`${provider === 'grok' ? 'grok login' : 'claude auth login'}\`), then set \`${provider === 'grok' ? 'grokPath' : 'claudePath'}\` in ~/.codex-claude-bridge/config.json if it isn't on PATH.`,
     );
     stream.closeOpen('final_answer');
     stream.complete(usageObject());
@@ -168,7 +171,7 @@ export async function runClaudeTurn({ config, state, stream, parsed, modelCfg, e
   // A side-chat fork only reads the parent's session and writes a new one, so it must not queue behind the parent's running turn.
   // Bug fixed 2026-09-25: a new Opus side chat sat at "Thinking 0s" until its parent's long typecheck turn finished.
   // A real Claude Code fork taken while the parent ran a 40-second foreground command worked, and the parent then finished normally.
-  const lockKey = parsed.resume && !parsed.fork ? parsed.resume.sid : rid(parsed.fork ? 'fork_' : 'new_');
+  const lockKey = `${provider}:${parsed.resume && !parsed.fork ? parsed.resume.sid : rid(parsed.fork ? 'fork_' : 'new_')}`;
   if (sessionLocks.has(lockKey)) log.info(`claude session ${lockKey} is busy; this turn waits for the running one`); // The "claude turn" line only appears once the wait ends.
   await withSessionLock(lockKey, async () => {
     if (stream.res.destroyed || stream.res.writableEnded) return; // A request stopped while queued must not start a paid turn or run tools after the previous turn releases this session.
@@ -185,24 +188,25 @@ export async function runClaudeTurn({ config, state, stream, parsed, modelCfg, e
     ];
     if (caps.partial) args.push('--include-partial-messages');
     if (caps.permissionPrompts) args.push('--permission-prompts', 'none');
-    const effortLevel = EFFORT[String(effort || '').toLowerCase()];
+    const requestedEffort = EFFORT[String(effort || '').toLowerCase()];
+    const effortLevel = provider === 'grok' && requestedEffort === 'max' ? 'xhigh' : requestedEffort;
     if (caps.effort && effortLevel) args.push('--effort', effortLevel);
     if (parsed.resume) args.push('--resume', parsed.resume.sid);
     if (parsed.fork) args.push('--fork-session');
     const skills = parsed.skills
-      ? `The user's Codex skills are listed below. They are in addition to your own Claude Code skills. When a task matches one, read its SKILL.md with the Read tool and follow it, exactly as you would one of your own skills. When the user names a skill (e.g. $name), use it.\n\n${parsed.skills}`
+      ? `The user's Codex skills are listed below. They are in addition to your own ${label} skills. When a task matches one, read its SKILL.md with the Read tool and follow it, exactly as you would one of your own skills. When the user names a skill (e.g. $name), use it.\n\n${parsed.skills}`
       : '';
     const catalog = codexToolCatalog(codexTools);
     const questionTool = catalog.get('request_user_input_async') ?? catalog.get('request_user_input'); // The desktop's async card works in every mode; the CLI's request_user_input is Plan-mode only.
     // Claude Code's own question tool has nowhere to appear in Codex, so Codex's question card replaces it.
     if (questionTool) args.push('--disallowedTools', 'AskUserQuestion');
     const questionsNote = questionTool ? codexQuestionsNote(questionTool) : PLAIN_TEXT_QUESTIONS_NOTE;
-    const system = [BRIDGE_NOTE, questionsNote, catalog.size ? CODEX_TOOLS_NOTE : '', config.extraSystemPrompt, ...parsed.agentsMd, skills, parsed.codexMemory]
+    const system = [providerNote(BRIDGE_NOTE), providerNote(questionsNote), catalog.size ? providerNote(CODEX_TOOLS_NOTE) : '', config.extraSystemPrompt, ...parsed.agentsMd, skills, parsed.codexMemory]
       .filter(Boolean)
       .join('\n\n');
     args.push('--append-system-prompt', system);
     const mcpConfig = { mcpServers: {} };
-    const env = claudeEnvironment(parsed.threadId);
+    const env = { ...claudeEnvironment(parsed.threadId), ...config.nativeEnvironment };
     // Calls Claude makes to Codex's tools; each waits here until Codex returns its result.
     const queuedCodexCalls = [];
     let codexToolServer = null;
@@ -243,7 +247,7 @@ export async function runClaudeTurn({ config, state, stream, parsed, modelCfg, e
     if (catalog.size) log.info(`codex tools for claude: ${[...catalog.keys()].join(', ')}`); // Tool names only; shows which Codex surfaces this turn could reach.
 
     log.info(
-      `claude turn model=${modelCfg.claudeModel} mode=${permissionMode} effort=${effortLevel || '-'} cwd=${cwd} ${
+      `${provider} turn model=${modelCfg.claudeModel} mode=${permissionMode} effort=${effortLevel || '-'} cwd=${cwd} ${
         parsed.resume ? `${parsed.fork ? 'fork' : 'resume'}=${parsed.resume.sid}` : 'new-session'
       }`,
     );
@@ -300,6 +304,7 @@ export async function runClaudeTurn({ config, state, stream, parsed, modelCfg, e
     });
 
     const ctx = {
+      provider,
       sid: parsed.resume?.sid || null,
       cwd,
       streamedMessageIds: new Set(),
@@ -342,6 +347,7 @@ export async function runClaudeTurn({ config, state, stream, parsed, modelCfg, e
     const waiting = new Map(); // callId -> call handed to Codex
     const turn = {
       id: nativeTurnId,
+      provider,
       threadId: parsed.threadId,
       agentMessageIds: new Set(parsed.agentMessageIds),
       // Codex sent the results: continue this same Claude process in Codex's new response.
@@ -398,7 +404,7 @@ export async function runClaudeTurn({ config, state, stream, parsed, modelCfg, e
       let marker;
       if (ctx.sid) {
         const turnId = rid('t');
-        marker = makeMarker(ctx.sid, turnId);
+        marker = makeMarker(ctx.sid, turnId, provider);
         stream.marker(marker);
         state.recordTurn(ctx.sid, turnId, parsed.threadId, [...turn.agentMessageIds]);
       }
@@ -438,14 +444,14 @@ export async function runClaudeTurn({ config, state, stream, parsed, modelCfg, e
     if (!r || r.is_error) {
       const reason = r?.result || r?.errors?.join?.('\n') || lastLines(stderr) || `claude exited with code ${exitCode}`;
       if (stream.hasOpenMessage()) stream.closeOpen('commentary');
-      stream.textDelta(`**Claude Code stopped:** ${reason}`);
-      log.error(`claude failed (code ${exitCode}): ${reason}`);
+      stream.textDelta(`**${label} stopped:** ${reason}`);
+      log.error(`${provider} failed (code ${exitCode}): ${reason}`);
     }
     stream.closeOpen('final_answer');
 
     if (ctx.sid) {
       const turnId = rid('t');
-      stream.marker(makeMarker(ctx.sid, turnId));
+      stream.marker(makeMarker(ctx.sid, turnId, provider));
       state.recordTurn(ctx.sid, turnId, parsed.threadId, [...turn.agentMessageIds]);
     }
 
@@ -460,6 +466,12 @@ export async function runClaudeTurn({ config, state, stream, parsed, modelCfg, e
 const CODEX_TOOL_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 
 function usageSoFar(ctx, outputTokens) {
+  if (ctx.provider === 'grok') {
+    // ACP can report only a total, or final usage without any assistant chunks.
+    // Pass ACP-reported input through without adding Claude-specific cache counts.
+    const usage = { ...ctx.lastUsage, ...ctx.result?.usage };
+    return usageObject({ input: usage.input_tokens ?? 0, cached: usage.cache_read_input_tokens ?? 0, output: outputTokens ?? usage.output_tokens ?? 0, total: usage.total_tokens });
+  }
   const u = ctx.lastUsage || {};
   const contextTokens = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
   return usageObject({ input: contextTokens, cached: u.cache_read_input_tokens || 0, output: outputTokens ?? u.output_tokens ?? 0 });
@@ -579,7 +591,7 @@ export async function compactSession({ config, sid, cwd, log, threadId, modelCfg
     // stdin must be closed: `claude -p` waits for piped stdin otherwise.
     const child = spawn(config.claudePath, args, {
       cwd: cwd && fs.existsSync(cwd) ? cwd : os.homedir(),
-      env: claudeEnvironment(threadId),
+      env: { ...claudeEnvironment(threadId), ...config.nativeEnvironment },
       stdio: [toolOutputs.length ? 'pipe' : 'ignore', 'pipe', 'pipe'],
     });
     if (toolOutputs.length) {

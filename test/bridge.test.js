@@ -758,7 +758,7 @@ test('GPT websocket frames drop bridge-only items, so a side chat off a Claude-c
     const fwd = JSON.parse(decodeClientTextFrames(upstreamWsData).at(-1));
     assert.doesNotMatch(JSON.stringify(fwd), /ccb/, 'no bridge ids or markers reach OpenAI');
     assert.equal(fwd.input.length, 3);
-    assert.match(fwd.input[0].content[0].text, /handled by Claude and then compacted/);
+    assert.match(fwd.input[0].content[0].text, /handled by another model and then compacted/);
     assert.equal(fwd.input[1].id, undefined);
     assert.equal(fwd.input[1].content[0].text, 'claude said');
     assert.equal(fwd.input[2].content[0].text, 'side question');

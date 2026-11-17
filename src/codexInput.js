@@ -3,6 +3,8 @@
 // where the last bridged turn ended.
 
 export const MARKER_PREFIX = 'ccb:v1:';
+const PROVIDER_MARKER_PREFIX = 'ccb:v2:';
+const NATIVE_PROVIDERS = new Set(['claude', 'grok']);
 export const BRIDGE_ID_PREFIXES = ['msg_ccb_', 'rs_ccb_', 'ws_ccb_', 'cmp_ccb_', 'fc_ccb_', 'ctc_ccb_'];
 // Bridge items that carry real conversation content (unlike markers and web search cards).
 const BRIDGE_CONTENT_TYPES = new Set(['message', 'function_call', 'custom_tool_call']);
@@ -10,21 +12,31 @@ const BRIDGE_CONTENT_TYPES = new Set(['message', 'function_call', 'custom_tool_c
 const MAX_CONTEXT_CHARS = 60000;
 const MAX_TOOL_OUTPUT_CHARS = 2000;
 
-export function makeMarker(sid, turnId) {
-  return `${MARKER_PREFIX}${sid}:${turnId}`;
+export function makeMarker(sid, turnId, provider = 'claude') {
+  if (!NATIVE_PROVIDERS.has(provider)) throw new Error(`Unsupported native provider: ${provider}`);
+  return provider === 'claude' ? `${MARKER_PREFIX}${sid}:${turnId}` : `${PROVIDER_MARKER_PREFIX}${provider}:${sid}:${turnId}`;
 }
 
 export function parseMarker(value) {
-  if (typeof value !== 'string' || !value.startsWith(MARKER_PREFIX)) return null;
-  const [sid, turnId] = value.slice(MARKER_PREFIX.length).split(':');
-  if (!sid || !turnId) return null;
-  return { sid, turnId };
+  if (typeof value !== 'string') return null;
+  const legacy = value.startsWith(MARKER_PREFIX);
+  if (!legacy && !value.startsWith(PROVIDER_MARKER_PREFIX)) return null;
+  const parts = value.slice(legacy ? MARKER_PREFIX.length : PROVIDER_MARKER_PREFIX.length).split(':');
+  if (parts.length !== (legacy ? 2 : 3) || parts.some((part) => !part || /\s/.test(part))) return null;
+  if (legacy) return { sid: parts[0], turnId: parts[1] };
+  const [provider, sid, turnId] = parts;
+  return NATIVE_PROVIDERS.has(provider) ? { sid, turnId, provider } : null;
+}
+
+// Even malformed bridge control data must stay local rather than becoming OpenAI ciphertext.
+function isBridgeMarker(value) {
+  return typeof value === 'string' && (value.startsWith(MARKER_PREFIX) || value.startsWith(PROVIDER_MARKER_PREFIX));
 }
 
 export function isBridgeItem(item) {
   if (!item || typeof item !== 'object') return false;
   if (typeof item.id === 'string' && BRIDGE_ID_PREFIXES.some((p) => item.id.startsWith(p))) return true;
-  return typeof item.encrypted_content === 'string' && item.encrypted_content.startsWith(MARKER_PREFIX);
+  return isBridgeMarker(item.encrypted_content);
 }
 
 function textOf(item) {
@@ -176,9 +188,10 @@ function isPromptMessage(item) {
 /**
  * @param {object} body Responses API request body from Codex
  * @param {(sid: string, turnId: string) => boolean} isLatestTurn
- * @param {(sid: string) => string[]} agentMessageIdsForSession IDs already sent to this native Claude session
+ * @param {(sid: string) => string[]} agentMessageIdsForSession IDs already sent to this native session
+ * @param {{provider?: 'claude' | 'grok'}} options Native provider whose session may resume
  */
-export function parseCodexRequest(body, isLatestTurn = () => false, agentMessageIdsForSession = () => []) {
+export function parseCodexRequest(body, isLatestTurn = () => false, agentMessageIdsForSession = () => [], { provider = 'claude' } = {}) {
   const rawInput = Array.isArray(body.input) ? body.input : [];
   const input = rawInput.map(normalizeAgentMessageForClaude);
   let cwd = null;
@@ -228,6 +241,9 @@ export function parseCodexRequest(body, isLatestTurn = () => false, agentMessage
   // Keep only the latest AGENTS.md block per source (Codex re-sends on change).
   agentsMd = dedupeAgents(agentsMd);
 
+  // The last native marker owns continuation. A provider switch starts fresh with the
+  // full transcript, even if this provider has an older resumable marker in the input.
+  if (marker && (marker.provider || 'claude') !== provider) marker = null;
   const resume = marker && isLatestTurn(marker.sid, marker.turnId) ? marker : null;
   const seenAgentMessageIds = new Set(resume ? agentMessageIdsForSession(resume.sid) : []);
   const agentMessages = new Set();
@@ -260,7 +276,7 @@ export function parseCodexRequest(body, isLatestTurn = () => false, agentMessage
   const contextLines = [];
   const contextImages = [];
   for (const it of newItems.slice(0, promptStart)) {
-    if (isBridgeItem(it) && !BRIDGE_CONTENT_TYPES.has(it.type)) continue; // A fresh session still needs earlier Claude replies and Codex tool calls; only bridge control items are omitted.
+    if (isBridgeItem(it) && !BRIDGE_CONTENT_TYPES.has(it.type)) continue; // A fresh session still needs earlier native replies and Codex tool calls; only bridge control items are omitted.
     const line = renderContextItem(it);
     if (line) contextLines.push(line);
     const historicalParts = it?.type === 'message' && it.role === 'user' ? it.content : ['function_call_output', 'custom_tool_call_output'].includes(it?.type) ? it.output : null;
@@ -351,9 +367,10 @@ export function sanitizeInputForOpenAI(input) {
       continue;
     }
     changed = true;
-    if (BRIDGE_CONTENT_TYPES.has(item.type)) { // Keep Claude's replies and Codex tool calls (their outputs refer to them); only the bridge-made id is dropped.
+    if (BRIDGE_CONTENT_TYPES.has(item.type)) { // Keep native replies and Codex tool calls (their outputs refer to them).
       const { id, ...rest } = item;
       void id;
+      if (isBridgeMarker(rest.encrypted_content)) delete rest.encrypted_content;
       out.push(rest);
     } else if (item.type === 'compaction') {
       out.push({
@@ -362,7 +379,7 @@ export function sanitizeInputForOpenAI(input) {
         content: [
           {
             type: 'input_text',
-            text: '<external_context>Earlier turns in this thread were handled by Claude and then compacted; their details are not available here.</external_context>',
+            text: '<external_context>Earlier turns in this thread were handled by another model and then compacted; their details are not available here.</external_context>',
           },
         ],
       });

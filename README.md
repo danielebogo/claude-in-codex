@@ -58,6 +58,32 @@ When upgrading from a version without local authentication, rerun the installer 
 
 **Uninstall:** `./scripts/uninstall.sh` stops the service and removes that line. Restart Codex afterwards.
 
+### Optional Grok provider
+
+The bridge can also run Grok Build through its existing Grok login. Install and sign in to the official `grok` CLI separately. No API key is required by this adapter: it requests cached-token authentication and removes `XAI_API_KEY` from the child environment. Access and usage remain governed by your Grok account; a successful login or model listing does not establish your remaining quota.
+
+Keep your existing Claude entries in the `models` array of `~/.codex-claude-bridge/config.json` and append:
+
+```json
+{
+  "slug": "grok-4.7",
+  "displayName": "Grok 4.7",
+  "provider": "grok",
+  "model": "grok-4.7",
+  "description": "Grok 4.7 through your Grok Build login."
+}
+```
+
+If you currently use the default model list, copy the entries from `src/models.json` into your `models` array first. `models` replaces that default list. Set `grokPath` to the absolute path printed by `command -v grok` when running under launchd, whose PATH can differ from your terminal. Provider entries without `provider` remain Claude entries and keep accepting the existing `claudeModel` field. Explicit entries use `provider` and `model`.
+
+Grok routes are opt-in; the default Claude catalog stays unchanged. The initial Grok route targets 4.7, with a 256,000-token advertised context and low/medium/high/xhigh reasoning. Fast models are not selected automatically. Model-data edits use the existing hot reload; changing an executable path needs an idle bridge restart. A live model slug cannot be reassigned to another provider: add a new slug and hide the old entry instead.
+
+The internal Grok adapter speaks ACP on stdin/stdout, translates its events into the shared native-turn stream, and supplies Codex MCP tools per session. Grok's native permission decisions are handled without interactive prompts; read-only/plan, workspace and full-access requests select the corresponding Grok sandbox profile. Codex-run tools continue through Codex's own approvals. Unknown permission requests are denied. Grok authentication errors stay on the Grok route and never reroute the prompt to Claude or GPT. Housekeeping calls still use GPT.
+
+Native session markers and on-disk ownership are provider-scoped. Switching between Claude and Grok starts a new native session with the available Codex history, using the existing history limits; it never passes one provider's session ID or pending tool result to the other. Same-provider follow-ups resume their native session. Grok forks start a separate session by replaying history because the observed ACP interface does not expose native forking. Send that fork a normal Grok message before compacting it; compaction cannot mutate its parent's session. Compaction requires an existing Grok session and the native `compact` command, and failures leave Codex's history intact.
+
+Grok token telemetry is preserved only when reported by ACP. A total token count is not converted into an invented input/output split or a context-meter estimate. Grok's native MCP timeout can be shorter than the bridge's 24-hour outer wait; its [documented default](https://docs.x.ai/build/settings/reference) is 6,000 seconds. A 24-hour native tool wait has not been verified.
+
 ### Optional model bar
 
 [Codex Model Bar](https://github.com/EthanSK/codex-model-bar) is a separate macOS companion app with one button per model below the Codex window. It reads Codex's model list, so the Claude models supplied by this bridge appear alongside GPT models. The bar switches the open task through Codex's own `/model` menu. Ordinary model requests finish at Return after one filtered-menu readiness check; reasoning requests finish at the last shortcut, reading intermediate effort labels only when another relative press depends on them. The existing background watcher reports the actual selection without a final blocking verification loop; a background check then warns if the requested model or effort does not appear within 5 seconds, without delaying the next click. The combined Astra/Ultrafast action retains confirmation before its dependent speed command. The bridge works without the bar; the bar's repository has its own source-build and Accessibility setup instructions.

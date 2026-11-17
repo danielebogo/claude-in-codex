@@ -1,7 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { ResponsesStream } from '../src/responsesStream.js';
+import { ResponsesStream, usageObject } from '../src/responsesStream.js';
 import { sanitizeInputForOpenAI } from '../src/codexInput.js';
+
+test('usage preserves an explicitly reported total and otherwise sums known components', () => {
+  assert.equal(usageObject({ input: 100, output: 9 }).total_tokens, 109);
+  assert.equal(usageObject({ total: 123 }).total_tokens, 123);
+  assert.equal(usageObject({ total: 123 }).input_tokens, 0);
+  assert.equal(usageObject({ total: 123 }).output_tokens, 0);
+  assert.equal(usageObject({ input: 100, output: 9, total: 0 }).total_tokens, 0);
+});
 
 test('Claude collaboration calls explicitly declare plaintext arguments to Codex', () => {
   for (const name of ['spawn_agent', 'send_message', 'followup_task']) {

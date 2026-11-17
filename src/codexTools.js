@@ -150,10 +150,11 @@ export function forgetCodexCalls(callIds) {
 }
 
 /**
- * Finds a Claude turn waiting on tool results in this request's input.
+ * Finds a native turn owned by this provider waiting on tool results in the request.
+ * Legacy waiting turns without a provider belong to Claude.
  * @returns {{ turn: object, outputs: Map<string, unknown>, userText: string, userAttachments: object[] } | null}
  */
-export function findCodexResults(input, threadId) {
+export function findCodexResults(input, threadId, provider = 'claude') {
   if (!Array.isArray(input)) return null;
   let turn = null;
   let lastOutput = -1;
@@ -161,13 +162,14 @@ export function findCodexResults(input, threadId) {
   input.forEach((item, index) => {
     if (item?.type !== 'function_call_output' && item?.type !== 'custom_tool_call_output') return;
     const waiting = waitingCalls.get(item.call_id);
-    if (!waiting || (threadId && waiting.turn.threadId !== threadId)) return;
+    if (!waiting || (waiting.turn.provider || 'claude') !== provider || (threadId && waiting.turn.threadId !== threadId)) return;
     turn = waiting.turn;
     lastOutput = index;
     outputs.set(item.call_id, item.output);
   });
   if (!turn) {
     for (const [callId, waiting] of waitingCalls) {
+      if ((waiting.turn.provider || 'claude') !== provider) continue;
       if (waiting.entry?.namespace !== 'collaboration' || waiting.entry.name !== 'wait_agent') continue;
       if (threadId && waiting.turn.threadId !== threadId) continue; // A fork can inherit the marker but must never resume the parent's pending tool.
       if ([...waitingCalls.values()].some((other) => other.turn === waiting.turn && other !== waiting)) continue; // A mailbox wake must not fabricate results for another tool handed off alongside this wait.

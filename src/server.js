@@ -11,7 +11,8 @@ import { loadConfig, loadModels, BASE_PATH, BRIDGE_HOME } from './config.js';
 import { State } from './state.js';
 import { parseCodexRequest, buildClaudeUserMessage, sanitizeInputForOpenAI, makeMarker } from './codexInput.js';
 import { ResponsesStream, usageObject, rid } from './responsesStream.js';
-import { runClaudeTurn, compactSession, claudeCapabilities, hasActiveClaudeTurns } from './claudeRunner.js';
+import { claudeCapabilities } from './claudeRunner.js';
+import { runNativeTurn, compactNativeSession, hasActiveNativeTurns, providerForModel, providerState } from './providers.js';
 import { mergeCatalog, fallbackGptModel } from './catalog.js';
 import { findCodexResults, cancelWaitingCodexTurns, cancelCodexTurns, waitingCodexTurns, waitingCodexTurnsReferencedBy } from './codexTools.js';
 import { diagnostics, diagnosticsSnapshot, logLifecycle, startResourceMonitor } from './diagnostics.js';
@@ -135,6 +136,10 @@ export function createBridge(initialConfig, state = new State()) {
       const snapshot = JSON.stringify(models);
       warnedInvalidModels = false;
       if (snapshot === modelSnapshot) return;
+      for (const model of models) {
+        const previous = claudeSlugs.get(model.slug);
+        if (previous && providerForModel(previous) !== providerForModel(model)) throw new Error('A live model slug cannot change provider. Use a new slug.');
+      }
       for (const model of models) claudeSlugs.set(model.slug, model); // Retain removed routes so an existing chat or waiting tool result still reaches Claude.
       config = { ...config, models }; // Existing native turns keep the configuration object and model they were admitted with.
       modelSnapshot = snapshot;
@@ -267,22 +272,26 @@ export function createBridge(initialConfig, state = new State()) {
       res.end(JSON.stringify({ error: previousResponseError(body.previous_response_id) }));
       return;
     }
-    const parsed = parseCodexRequest(body, (sid, turnId) => state.isLatestTurn(sid, turnId), (sid) => state.agentMessageIds(sid));
+    const provider = providerForModel(modelCfg);
+    const nativeState = providerState(state, provider);
+    const parse = (isLatest = (sid, turnId) => nativeState.isLatestTurn(sid, turnId)) => parseCodexRequest(body, isLatest, (sid) => nativeState.agentMessageIds(sid), { provider });
+    let parsed = parse();
     // Log request structure, never prompt text or credentials, when tracing missing side-chat context.
-    log.debug(`Claude request shape ${JSON.stringify({ keys: Object.keys(body), inputCount: Array.isArray(body.input) ? body.input.length : 0, sandboxMode: parsed.sandboxMode, hasCwd: Boolean(parsed.cwd), hasResume: Boolean(parsed.resume) })}`);
+    log.debug(`${provider} request shape ${JSON.stringify({ keys: Object.keys(body), inputCount: Array.isArray(body.input) ? body.input.length : 0, sandboxMode: parsed.sandboxMode, hasCwd: Boolean(parsed.cwd), hasResume: Boolean(parsed.resume) })}`);
     // Side chats / forked threads start from the parent's history: give them their own
     // fork of the parent's Claude session instead of taking over the parent's session.
     const threadId = requestThreadId(req.headers, body);
+    const owner = parsed.marker ? nativeState.ownerThread(parsed.marker.sid) : null;
+    const differentSessionOwner = Boolean(owner && threadId && owner !== threadId); // Compaction also uses inherited markers that are no longer the parent's latest turn.
+    if (provider === 'grok' && differentSessionOwner && !parsed.hasCompactionTrigger) parsed = parse(() => false); // Grok ACP has no fork operation: replay this fork into a new native session without mutating its parent.
     parsed.threadId = threadId;
     parsed.codexTurnId = String(req.headers['turn-id'] || req.headers['x-codex-turn-id'] || crypto.randomUUID());
-    const owner = parsed.marker ? state.ownerThread(parsed.marker.sid) : null;
-    const differentSessionOwner = Boolean(owner && threadId && owner !== threadId); // Compaction also uses inherited markers that are no longer the parent's latest turn.
-    parsed.fork = Boolean(parsed.resume && differentSessionOwner);
+    parsed.fork = provider === 'claude' && Boolean(parsed.resume && differentSessionOwner);
     const stream = new ResponsesStream(res, { model: body.model });
     stream.begin();
 
     // Codex ran tools a waiting Claude turn asked for: that same Claude process continues in this response.
-    const results = findCodexResults(body.input, threadId);
+    const results = findCodexResults(body.input, threadId, provider);
     if (results && !parsed.hasCompactionTrigger) { // A compact request may contain the just-finished tool result; resuming normal work here gives Codex zero compaction items.
       results.turn.resume(stream, results);
       return;
@@ -293,12 +302,16 @@ export function createBridge(initialConfig, state = new State()) {
     if (parsed.hasCompactionTrigger) {
       // Codex wants to compact a Claude thread: compact the Claude session instead.
       const sid = parsed.marker?.sid;
+      if (provider === 'grok' && !sid) {
+        stream.fail('Send a normal Grok message before compacting this conversation; no Grok session has received its history yet.');
+        return;
+      }
       let newSid = sid;
       if (sid) {
-        stream.reasoning('**Compacting Claude Code context**');
+        stream.reasoning(`**Compacting ${provider === 'grok' ? 'Grok Build' : 'Claude Code'} context**`);
         const keep = setInterval(() => stream.keepAlive(), config.keepAliveSeconds * 1000);
         const toolOutputs = (body.input || []).slice((parsed.marker?.index ?? -1) + 1).filter((item) => ['function_call_output', 'custom_tool_call_output'].includes(item?.type)); // These results may not have reached the stopped native turn; retain them even when retrying a failed compact.
-        const r = await compactSession({ config, sid, cwd: parsed.cwd, log, threadId, modelCfg, toolOutputs, fork: differentSessionOwner });
+        const r = await compactNativeSession({ config, sid, cwd: parsed.cwd, log, threadId, modelCfg, toolOutputs, fork: differentSessionOwner });
         clearInterval(keep);
         if (!r.ok) {
           stream.fail(r.error); // A failed compaction must not replace Codex's history or claim the parent's session.
@@ -307,15 +320,15 @@ export function createBridge(initialConfig, state = new State()) {
         newSid = r.sessionId;
       }
       const turnId = rid('t');
-      stream.compaction(newSid ? makeMarker(newSid, turnId) : 'ccb:v1:none:none');
-      if (newSid) state.recordTurn(newSid, turnId, parsed.threadId, state.agentMessageIds(sid)); // Compaction does not deliver new messages, and a fork inherits only IDs already received by its parent.
+      stream.compaction(newSid ? makeMarker(newSid, turnId, provider) : 'ccb:v1:none:none');
+      if (newSid) nativeState.recordTurn(newSid, turnId, parsed.threadId, nativeState.agentMessageIds(sid)); // Compaction does not deliver new messages, and a fork inherits only IDs already received by its parent.
       stream.complete(usageObject());
       return;
     }
 
     const userMessage = buildClaudeUserMessage(parsed, { newSession: !parsed.resume });
     if (config.debugDumpDir) dump('claude-prompt', { parsed: { ...parsed, images: parsed.images.length }, userMessage });
-    await runClaudeTurn({
+    await runNativeTurn({
       config,
       state,
       stream,
@@ -439,7 +452,7 @@ export function createBridge(initialConfig, state = new State()) {
       },
     };
     const hasCompactionTrigger = Array.isArray(body.input) && body.input.some((item) => item?.type === 'compaction_trigger');
-    const isContinuation = !hasCompactionTrigger && findCodexResults(body.input, threadId);
+    const isContinuation = !hasCompactionTrigger && findCodexResults(body.input, threadId, providerForModel(modelCfg));
     const rejectCapacity = () => {
       sendWebSocket(client, JSON.stringify({ type: 'error', status: 503, error: { message: 'Bridge Claude turn capacity reached; retry after another turn completes.' } }), false);
     };
@@ -737,13 +750,16 @@ export function createBridge(initialConfig, state = new State()) {
 const isMain = process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url));
 if (isMain) {
   const { server, log, config, state } = createBridge();
-  claudeCapabilities(config.claudePath).then((caps) => {
-    if (!caps.ok) log.error(`claude CLI not found at "${config.claudePath}" — set claudePath in ${BRIDGE_HOME}/config.json`);
-    else log.info(`claude CLI ok (${config.claudePath})`);
-  });
+  for (const provider of new Set(config.models.map(providerForModel))) {
+    const key = provider === 'grok' ? 'grokPath' : 'claudePath';
+    claudeCapabilities(config[key]).then((caps) => {
+      if (!caps.ok) log.error(`${provider} CLI not found at "${config[key]}" — set ${key} in ${BRIDGE_HOME}/config.json`);
+      else log.info(`${provider} CLI ok (${config[key]})`);
+    });
+  }
   server.listen(config.port, config.host, () => {
     log.info(`listening on http://${config.host}:${config.port}${BASE_PATH} → ${config.upstream}`);
-    log.info(`Claude models: ${config.models.map((m) => `${m.displayName} (${m.slug})`).join(', ')}`);
+    log.info(`Native models: ${config.models.map((m) => `${m.displayName} (${m.slug})`).join(', ')}`);
     startResourceMonitor({ log, state }); // Started only after a successful listen, so a failed second instance logs nothing extra.
   });
   // Reload after code updates: exit once idle and let launchd restart us with the new code.
@@ -754,7 +770,7 @@ if (isMain) {
     process.exit(0);
   };
   const restartIfIdle = () => {
-    if (active === 0 && !hasActiveClaudeTurns()) exitGracefully(); // Codex tool handoffs end the HTTP response while the same Claude turn is still waiting for its result.
+    if (active === 0 && !hasActiveNativeTurns()) exitGracefully(); // Codex tool handoffs end the HTTP response while the native turn still waits for its result.
   };
   server.on('request', (req, res) => {
     active++;

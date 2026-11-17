@@ -1,9 +1,79 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildClaudeUserMessage, classifyUserText, makeMarker, parseCodexRequest, sanitizeInputForOpenAI } from '../src/codexInput.js';
+import { buildClaudeUserMessage, classifyUserText, isBridgeItem, makeMarker, parseMarker, parseCodexRequest, sanitizeInputForOpenAI } from '../src/codexInput.js';
 
 const userMessage = (text) => ({ type: 'message', role: 'user', content: [{ type: 'input_text', text }] });
 import { chatDelivery } from './fixtures/codex-delegation.js';
+
+// Failure modes:
+// - A foreign provider's latest marker resumes an unrelated native session.
+// - A malformed control marker leaks to OpenAI or silently changes session identity.
+// - Replaying after a switch drops earlier native text or tool history.
+test('native session markers retain legacy Claude identity and identify Grok separately', () => {
+  assert.equal(makeMarker('session', 'turn'), 'ccb:v1:session:turn');
+  assert.equal(makeMarker('session', 'turn', 'claude'), 'ccb:v1:session:turn');
+  assert.deepEqual(parseMarker('ccb:v1:session:turn'), { sid: 'session', turnId: 'turn' });
+  assert.equal(makeMarker('session', 'turn', 'grok'), 'ccb:v2:grok:session:turn');
+  assert.deepEqual(parseMarker('ccb:v2:grok:session:turn'), { sid: 'session', turnId: 'turn', provider: 'grok' });
+  for (const malformed of [null, '', 'ccb:v1::turn', 'ccb:v1:session:', 'ccb:v1:session:turn:extra', 'ccb:v2:grok:session', 'ccb:v2::session:turn', 'ccb:v2:unknown:session:turn', 'ccb:v2:grok:session:turn:extra', 'ccb:v2:grok:session:turn\n']) {
+    assert.equal(parseMarker(malformed), null, `reject ${JSON.stringify(malformed)}`);
+  }
+  assert.throws(() => makeMarker('session', 'turn', 'unknown'), /provider/i);
+});
+
+test('Grok resumes only its latest native marker with an unchanged native session ID', () => {
+  const marker = { type: 'reasoning', encrypted_content: makeMarker('native-session', 'turn', 'grok') };
+  const lookups = [];
+  const parsed = parseCodexRequest({ input: [userMessage('Old request'), marker, userMessage('Continue.')] }, (sid, turnId) => {
+    lookups.push([sid, turnId]);
+    return true;
+  }, () => [], { provider: 'grok' });
+  assert.deepEqual(lookups, [['native-session', 'turn']]);
+  assert.deepEqual(parsed.resume, { sid: 'native-session', turnId: 'turn', provider: 'grok', index: 1 });
+  assert.equal(parsed.promptText, 'Continue.');
+  assert.equal(parsed.context, '');
+});
+
+test('a provider switch replays the full transcript instead of resuming any earlier matching marker', () => {
+  for (const [provider, foreign] of [['claude', 'grok'], ['grok', 'claude']]) {
+    const input = [
+      userMessage('Original request'),
+      { type: 'reasoning', encrypted_content: makeMarker('same-native-id', 'old', provider) },
+      { type: 'message', id: 'msg_ccb_earlier', role: 'assistant', content: [{ type: 'output_text', text: 'Earlier native reply' }] },
+      { type: 'custom_tool_call', id: 'ctc_ccb_earlier', name: 'exec', input: 'show context' },
+      { type: 'reasoning', encrypted_content: makeMarker('same-native-id', 'latest', foreign) },
+      userMessage('Continue.'),
+    ];
+    const parsed = parseCodexRequest({ input }, () => assert.fail('a foreign marker must not reach native state'), () => assert.fail('a foreign session must not load delivery IDs'), { provider });
+    assert.equal(parsed.marker, null);
+    assert.equal(parsed.resume, null);
+    assert.equal(parsed.promptText, 'Continue.');
+    assert.match(parsed.context, /Original request/);
+    assert.match(parsed.context, /Earlier native reply/);
+    assert.match(parsed.context, /show context/);
+    assert.doesNotMatch(parsed.context, /ccb:v[12]:/);
+  }
+});
+
+test('GPT turns do not prevent a subsequent Claude resume when no foreign native marker was added', () => {
+  const marker = { type: 'reasoning', encrypted_content: makeMarker('session', 'turn') };
+  const parsed = parseCodexRequest({ input: [marker, userMessage('Ask GPT'), { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'GPT reply' }] }, userMessage('Back to Claude')] }, () => true);
+  assert.equal(parsed.resume.sid, 'session');
+  assert.match(parsed.context, /GPT reply/);
+  assert.equal(parsed.promptText, 'Back to Claude');
+});
+
+test('OpenAI sanitation removes both native control marker versions while retaining native content', () => {
+  const markers = ['ccb:v1:session:turn', 'ccb:v2:grok:session:turn', 'ccb:v2:unknown:session:turn'].map((encrypted_content) => ({ type: 'reasoning', encrypted_content }));
+  for (const marker of markers) assert.equal(isBridgeItem(marker), true);
+  const reply = { type: 'message', id: 'msg_ccb_reply', role: 'assistant', encrypted_content: makeMarker('session', 'turn', 'grok'), content: [{ type: 'output_text', text: 'Native reply' }] };
+  const compaction = { type: 'compaction', id: 'cmp_ccb_native', encrypted_content: makeMarker('session', 'turn', 'grok') };
+  const sanitized = sanitizeInputForOpenAI([...markers, reply, compaction]);
+  assert.equal(sanitized.changed, true);
+  assert.equal(sanitized.input.length, 2);
+  assert.equal(sanitized.input[0].content[0].text, 'Native reply');
+  assert.doesNotMatch(JSON.stringify(sanitized.input), /ccb:v[12]:|Claude/);
+});
 
 test('incoming chat deliveries stay complete and attributed on new and resumed turns', () => {
   const delivery = { ...chatDelivery, output: chatDelivery.output.replace('Remember apricot.', 'Remember apricot. '.repeat(5000)) };

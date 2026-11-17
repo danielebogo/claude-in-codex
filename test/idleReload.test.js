@@ -152,6 +152,24 @@ test('model reload preserves running and retired Claude routes and rejects broke
   assert.equal(bridge.child.exitCode, null, bridge.log());
 });
 
+test('model reload cannot reassign an existing route to another native provider', { timeout: 8000 }, async (t) => {
+  const upstream = http.createServer((_req, res) => res.end(JSON.stringify({ models: [{ slug: 'gpt-test', visibility: 'list', priority: 1 }] })));
+  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+  t.after(() => { upstream.closeAllConnections(); upstream.close(); });
+  const bridge = await startReloadBridge(t, 'tools', { upstream: `http://127.0.0.1:${upstream.address().port}/backend-api/codex` });
+  const modelFile = path.join(bridge.directory, 'src/models.json');
+  const models = JSON.parse(fs.readFileSync(modelFile, 'utf8'));
+  const grok = { slug: 'provider-stable-route', displayName: 'Original Grok route', provider: 'grok', model: 'grok-4.7' };
+  fs.writeFileSync(modelFile, JSON.stringify([...models, grok]));
+  const catalog = () => fetch(bridge.url.replace('/responses', '/models')).then((response) => response.json());
+  assert.ok((await catalog()).models.some((model) => model.slug === grok.slug));
+
+  fs.writeFileSync(modelFile, JSON.stringify([...models, { ...grok, displayName: 'Reassigned Claude route', provider: 'claude', model: 'claude-test' }]));
+
+  assert.equal((await catalog()).models.find((model) => model.slug === grok.slug).display_name, grok.displayName);
+  assert.equal(bridge.child.exitCode, null, bridge.log());
+});
+
 test('source reload waits for a Claude turn between Codex tool responses', { timeout: 8000 }, async (t) => {
   const bridge = await startReloadBridge(t, 'codex-tools');
   const input = [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'use a Codex tool' }] }];
@@ -194,4 +212,40 @@ test('source reload waits for compaction after its HTTP client disconnects', { t
   fs.writeFileSync(bridge.releaseFile, 'finish');
   await bridge.closed;
   assert.equal(bridge.child.exitCode, 0, bridge.log());
+});
+
+test('source reload waits for a Grok native turn across a Codex tool handoff', { timeout: 10000 }, async (t) => {
+  const previousMode = process.env.GROK_FIXTURE_MODE;
+  process.env.GROK_FIXTURE_MODE = 'mcp-call';
+  t.after(() => {
+    if (previousMode === undefined) delete process.env.GROK_FIXTURE_MODE;
+    else process.env.GROK_FIXTURE_MODE = previousMode;
+  });
+  const bridge = await startReloadBridge(t, 'tools', {
+    models: [{ slug: 'grok-test', displayName: 'Grok test', provider: 'grok', model: 'grok-4.7' }],
+    grokPath: new URL('./fixtures/fake-grok.js', import.meta.url).pathname,
+  });
+  const input = [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'use a Codex tool' }] }];
+  const tools = [{ type: 'function', name: 'shell', parameters: { type: 'object', properties: {} } }];
+  async function request(items) {
+    const response = await fetch(bridge.url, { method: 'POST', headers: { 'content-type': 'application/json', 'thread-id': 'grok-reload-owner' }, body: JSON.stringify({ model: 'grok-test', input: items, tools }) });
+    const text = await response.text();
+    return text.split('\n').filter((line) => line.startsWith('data: ') && !line.includes('[DONE]')).map((line) => JSON.parse(line.slice(6))).find((event) => event.type === 'response.completed').response;
+  }
+  const first = await request(input);
+  const call = first.output.find((item) => item.type === 'function_call');
+  assert.ok(call);
+  assert.equal(parseMarker(first.output.find((item) => item.encrypted_content)?.encrypted_content).provider, 'grok');
+
+  fs.appendFileSync(path.join(bridge.directory, 'src/toolDisplay.js'), '\n');
+  await new Promise((resolve) => setTimeout(resolve, 600));
+
+  assert.equal(bridge.child.exitCode, null, bridge.log());
+  const finished = await request([...input, ...first.output, { type: 'function_call_output', call_id: call.call_id, output: 'Grok reload waited' }]);
+  assert.equal(finished.end_turn, true);
+  await bridge.closed;
+  assert.equal(bridge.child.exitCode, 0, bridge.log());
+  const marker = parseMarker(finished.output.find((item) => item.encrypted_content)?.encrypted_content);
+  const saved = JSON.parse(fs.readFileSync(path.join(bridge.directory, 'state.json'), 'utf8'));
+  assert.equal(saved.sessions[`grok:${marker.sid}`].threadId, 'grok-reload-owner');
 });

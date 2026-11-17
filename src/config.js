@@ -27,8 +27,10 @@ function modelsFromConfig(user) {
   const slugs = new Set();
   if (!Array.isArray(models)) throw new Error('Expected a model list');
   for (const model of models) {
-    if (!model || ['slug', 'displayName', 'claudeModel'].some((key) => typeof model[key] !== 'string' || !model[key].trim()) || slugs.has(model.slug)) {
-      throw new Error('Each model needs a unique slug, displayName and claudeModel');
+    const provider = model?.provider ?? 'claude';
+    const nativeModel = model?.model ?? (provider === 'claude' ? model?.claudeModel : undefined);
+    if (!model || !['claude', 'grok'].includes(provider) || ['slug', 'displayName'].some((key) => typeof model[key] !== 'string' || !model[key].trim()) || typeof nativeModel !== 'string' || !nativeModel.trim() || slugs.has(model.slug)) {
+      throw new Error('Each model needs a unique slug, displayName, supported provider (claude or grok), and native model (model, or legacy claudeModel).');
     }
     if (model.hidden !== undefined && typeof model.hidden !== 'boolean') throw new Error('Model hidden must be a boolean');
     slugs.add(model.slug);
@@ -81,6 +83,8 @@ export const DEFAULTS = {
   upstream: 'https://chatgpt.com/backend-api/codex',
   // Absolute path is best when running under launchd (PATH is minimal there).
   claudePath: 'claude',
+  // Used only by explicitly configured Grok routes; the CLI retains its own existing OAuth login.
+  grokPath: 'grok',
   // Models added to Codex's picker. `claudeModel` is passed to `claude --model`.
   // Every displayName includes the model version (e.g. "Fable 5.2", not "Fable"), so
   // the picker always shows exactly which model a chat runs on.
@@ -130,6 +134,7 @@ export function loadConfig() {
   if (process.env.CODEX_CLAUDE_BRIDGE_PORT) config.port = Number(process.env.CODEX_CLAUDE_BRIDGE_PORT);
   if (process.env.CODEX_CLAUDE_BRIDGE_UPSTREAM) config.upstream = process.env.CODEX_CLAUDE_BRIDGE_UPSTREAM;
   if (process.env.CODEX_CLAUDE_BRIDGE_CLAUDE) config.claudePath = process.env.CODEX_CLAUDE_BRIDGE_CLAUDE;
+  if (process.env.CODEX_CLAUDE_BRIDGE_GROK) config.grokPath = process.env.CODEX_CLAUDE_BRIDGE_GROK;
   config.upstream = config.upstream.replace(/\/+$/, '');
   return config;
 }
