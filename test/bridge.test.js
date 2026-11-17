@@ -1,4 +1,5 @@
 // Exercises bridge routing, Claude session continuity and Codex tool/compaction handoffs with local fixtures.
+import { localAuth, securePath } from './fixtures/local-auth.js';
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
@@ -80,7 +81,7 @@ before(async () => {
   });
   await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
   const config = {
-    ...DEFAULTS,
+    ...DEFAULTS, localAuth,
     port: 0,
     upstream: `http://127.0.0.1:${upstream.address().port}/backend-api/codex`,
     claudePath: fakeClaude,
@@ -101,7 +102,7 @@ after(() => {
 function request(pathname, { method = 'POST', body, headers = {} } = {}) {
   return new Promise((resolve, reject) => {
     const req = http.request(
-      { host: '127.0.0.1', port, path: pathname, method, headers: { authorization: 'Bearer test', ...headers } },
+      { host: '127.0.0.1', port, path: securePath(pathname), method, headers: { authorization: 'Bearer test', ...headers } },
       (res) => {
         let data = '';
         res.on('data', (d) => (data += d));
@@ -214,7 +215,7 @@ test('model catalog adds Claude models after GPT', async () => {
 test('hidden upstream models stay available without appearing in the picker', () => {
   const hiddenModels = ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'];
   const olderModels = hiddenModels.map((slug, index) => ({ ...GPT_MODEL, slug, priority: index + 4 }));
-  const models = mergeCatalog({ ...DEFAULTS, hiddenModels }, new State(path.join(tmp, 'hidden-state.json')), [GPT_MODEL, ...olderModels]);
+  const models = mergeCatalog({ ...DEFAULTS, localAuth, hiddenModels }, new State(path.join(tmp, 'hidden-state.json')), [GPT_MODEL, ...olderModels]);
   for (const slug of hiddenModels) assert.equal(models.find((model) => model.slug === slug).visibility, 'hide');
   assert.equal(models.find((model) => model.slug === 'gpt-6-sol').visibility, 'list');
   assert.deepEqual(models.slice(-3).map((model) => model.slug), ['claude-opus-5-5', 'claude-fable-5-2', 'claude-fable-5-1']);
@@ -473,7 +474,7 @@ test('compaction of a Claude thread runs /compact and returns one compaction ite
 
 test('unhinted websocket prewarms GPT and Claude without an upgrade error', async () => {
   upstreamUpgradeRequests = [];
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/backend-api/codex/responses`, {
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/${localAuth.token}/backend-api/codex/responses`, {
     headers: { authorization: 'Bearer test' },
   });
   await new Promise((resolve, reject) => {
@@ -511,7 +512,7 @@ test('unhinted websocket prewarms GPT and Claude without an upgrade error', asyn
 
 test('a fresh Opus websocket side chat reaches Claude and can later switch to GPT', async () => {
   upstreamUpgradeRequests = [];
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/backend-api/codex/responses`, {
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/${localAuth.token}/backend-api/codex/responses`, {
     headers: { 'x-codex-routing-hint': 'model=claude-opus-5-5', authorization: 'Bearer test' },
   });
   await new Promise((resolve, reject) => {
@@ -578,7 +579,7 @@ test('GPT websocket traffic and auth pass through to upstream', async () => {
   upstreamUpgradeRequests = [];
   const reply = await new Promise((resolve, reject) => {
     const socket = net.connect(port, '127.0.0.1', () => {
-      socket.write('GET /backend-api/codex/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nx-codex-routing-hint: model=gpt-6-sol;tier=priority\r\nAuthorization: Bearer test\r\n\r\n');
+      socket.write(`GET /${localAuth.token}/backend-api/codex/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nx-codex-routing-hint: model=gpt-6-sol;tier=priority\r\nAuthorization: Bearer test\r\n\r\n`);
     });
     let data = Buffer.alloc(0);
     let handshake = false;
@@ -606,7 +607,7 @@ test('GPT websocket traffic and auth pass through to upstream', async () => {
 });
 
 test('an Opus side-chat turn on a GPT-prewarmed websocket goes to Claude', async () => {
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/backend-api/codex/responses`, {
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/${localAuth.token}/backend-api/codex/responses`, {
     headers: { 'x-codex-routing-hint': 'model=gpt-6-sol', authorization: 'Bearer test' },
   });
   await new Promise((resolve, reject) => {
@@ -672,7 +673,7 @@ test('an Opus side-chat turn on a GPT-prewarmed websocket goes to Claude', async
 });
 
 test('side-chat delta requests retain prewarm context, resume Claude, and replay history on a GPT switch', async () => {
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/backend-api/codex/responses`);
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/${localAuth.token}/backend-api/codex/responses`);
   await new Promise((resolve, reject) => { socket.once('open', resolve); socket.once('error', reject); });
   const body = (input, extra = {}) => JSON.parse(responsesBody('claude-opus-5-5', input, extra));
   try {
@@ -706,7 +707,7 @@ test('side-chat delta requests retain prewarm context, resume Claude, and replay
 });
 
 test('side-chat response caches stay separate and unknown response IDs require full-context replay', async () => {
-  const sockets = [new WebSocket(`ws://127.0.0.1:${port}/backend-api/codex/responses`), new WebSocket(`ws://127.0.0.1:${port}/backend-api/codex/responses`)];
+  const sockets = [new WebSocket(`ws://127.0.0.1:${port}/${localAuth.token}/backend-api/codex/responses`), new WebSocket(`ws://127.0.0.1:${port}/${localAuth.token}/backend-api/codex/responses`)];
   await Promise.all(sockets.map((socket) => new Promise((resolve, reject) => { socket.once('open', resolve); socket.once('error', reject); })));
   const body = (text, previous_response_id) => JSON.parse(responsesBody('claude-opus-5-5', [userMsg(text)], { previous_response_id }));
   try {
@@ -729,7 +730,7 @@ test('side-chat response caches stay separate and unknown response IDs require f
 });
 
 test('GPT websocket frames drop bridge-only items, so a side chat off a Claude-compacted thread works', async () => {
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/backend-api/codex/responses`, {
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/${localAuth.token}/backend-api/codex/responses`, {
     headers: { 'x-codex-routing-hint': 'model=gpt-6-sol', authorization: 'Bearer test' },
   });
   await new Promise((resolve, reject) => {
@@ -776,7 +777,7 @@ test('GPT websocket frames drop bridge-only items, so a side chat off a Claude-c
 test('browser origins cannot open a GPT websocket through the bridge', async () => {
   const reply = await new Promise((resolve) => {
     const socket = net.connect(port, '127.0.0.1', () => {
-      socket.write('GET /backend-api/codex/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nx-codex-routing-hint: model=gpt-6-sol\r\nOrigin: https://evil.example\r\n\r\n');
+      socket.write(`GET /${localAuth.token}/backend-api/codex/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nx-codex-routing-hint: model=gpt-6-sol\r\nOrigin: https://evil.example\r\n\r\n`);
     });
     let data = '';
     socket.on('data', (chunk) => (data += chunk));
@@ -886,7 +887,7 @@ test('a stopped queued request never starts a Claude process after the running t
     assert.equal(readClaudeLog().length, 2, 'the resumed native command must already be running');
     delete process.env.FAKE_CLAUDE_SCENARIO;
     await new Promise((resolve) => {
-      const req = http.request({ host: '127.0.0.1', port, path: '/backend-api/codex/responses', method: 'POST', headers }, (res) => {
+      const req = http.request({ host: '127.0.0.1', port, path: securePath('/backend-api/codex/responses'), method: 'POST', headers }, (res) => {
         res.once('close', resolve);
         res.once('data', () => req.destroy()); // Stop the queued Codex response while the first native turn still holds the session.
       });
@@ -1098,7 +1099,7 @@ test('WebSocket compaction after a tool handoff returns a compaction item, not a
   process.env.FAKE_CLAUDE_SCENARIO = 'codex-tools';
   process.env.FAKE_CODEX_TOOL = 'exec';
   const thread = 'ws-compact-tools';
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/backend-api/codex/responses`, { headers: { 'thread-id': thread } });
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/${localAuth.token}/backend-api/codex/responses`, { headers: { 'thread-id': thread } });
   try {
     await new Promise((resolve, reject) => { socket.once('open', resolve); socket.once('error', reject); });
     const input = [perms, envContext(workdir), userMsg('list my tasks')];
@@ -1142,7 +1143,7 @@ test('a failed compact can retry without losing the just-finished tool result', 
 test('WebSocket follow-ups carrying only Codex tool results continue the waiting Claude turn', async () => {
   process.env.FAKE_CLAUDE_SCENARIO = 'codex-tools';
   process.env.FAKE_CODEX_TOOL = 'exec';
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/backend-api/codex/responses`);
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/${localAuth.token}/backend-api/codex/responses`);
   await new Promise((resolve, reject) => { socket.once('open', resolve); socket.once('error', reject); });
   try {
     const body = (input, extra = {}) => ({ ...JSON.parse(responsesBody('claude-opus-5-5', input, { tools: codexTools })), ...extra });
@@ -1170,14 +1171,14 @@ test('a mailbox reply reconnects without the preempted wait call and keeps the s
     const tools = [{ type: 'namespace', name: 'collaboration', tools: [{ type: 'function', name: 'wait_agent', parameters: { type: 'object', properties: {} } }] }];
     const input = [perms, envContext(workdir), userMsg('Wait for the child reply.')];
     const body = (items) => ({ ...JSON.parse(responsesBody('claude-opus-5-5', items, { tools })), client_metadata: { thread_id: 'mailbox-thread' } });
-    const socket = new WebSocket(`ws://127.0.0.1:${port}/backend-api/codex/responses`);
+    const socket = new WebSocket(`ws://127.0.0.1:${port}/${localAuth.token}/backend-api/codex/responses`);
     sockets.push(socket);
     await new Promise((resolve, reject) => { socket.once('open', resolve); socket.once('error', reject); });
     const first = await webSocketTurn(socket, body(input));
     assert.equal(first.response.output.find((item) => item.type === 'function_call').name, 'wait_agent');
     socket.close();
     const replay = first.response.output.filter((item) => item.type !== 'function_call'); // Real Codex removes the preempted call but retains the bridge's preceding marker.
-    const nextSocket = new WebSocket(`ws://127.0.0.1:${port}/backend-api/codex/responses`);
+    const nextSocket = new WebSocket(`ws://127.0.0.1:${port}/${localAuth.token}/backend-api/codex/responses`);
     sockets.push(nextSocket);
     await new Promise((resolve, reject) => { nextSocket.once('open', resolve); nextSocket.once('error', reject); });
     const message = { type: 'agent_message', author: '/root/child', recipient: '/root', content: [{ type: 'input_text', text: 'Child result: apricot' }] };

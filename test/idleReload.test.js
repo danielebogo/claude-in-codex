@@ -44,7 +44,8 @@ async function startReloadBridge(t, scenario, config = {}) {
   const readyDeadline = Date.now() + 2000;
   while (!log.includes('listening on') && child.exitCode === null && Date.now() < readyDeadline) await new Promise((resolve) => setTimeout(resolve, 20));
   assert.match(log, /listening on/);
-  return { directory, releaseFile, fixtureLog, child, closed, log: () => log, url: `http://127.0.0.1:${port}/backend-api/codex/responses` };
+  const auth = JSON.parse(fs.readFileSync(path.join(directory, 'local-auth.json'), 'utf8'));
+  return { directory, releaseFile, fixtureLog, child, closed, log: () => log, token: auth.token, url: `http://127.0.0.1:${port}/${auth.token}/backend-api/codex/responses` };
 }
 
 test('model data hot swaps on an existing GPT WebSocket without restarting it', { timeout: 8000 }, async (t) => {
@@ -107,7 +108,7 @@ test('model data hot swaps on an existing GPT WebSocket without restarting it', 
 
 test('model reload preserves running and retired Claude routes and rejects broken edits', { timeout: 8000 }, async (t) => {
   const bridge = await startReloadBridge(t, 'hold-native');
-  const health = () => fetch(new URL('/health', bridge.url)).then((response) => response.json());
+  const health = () => fetch(new URL(`/${bridge.token}/health`, bridge.url)).then((response) => response.json());
   const input = [
     { type: 'message', role: 'user', content: [{ type: 'input_text', text: `<environment_context><cwd>${bridge.directory}</cwd></environment_context>` }] },
     { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hello' }] },

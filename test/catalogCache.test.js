@@ -1,3 +1,4 @@
+import { localAuth } from './fixtures/local-auth.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
@@ -24,7 +25,7 @@ test('catalog fallback preserves client and account lists across outages and res
     }));
   });
   await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
-  const config = { ...DEFAULTS, upstream: `http://127.0.0.1:${upstream.address().port}`, logLevel: 'error' };
+  const config = { ...DEFAULTS, localAuth, upstream: `http://127.0.0.1:${upstream.address().port}`, logLevel: 'error' };
   const stateFile = path.join(directory, 'state.json');
   const state = new State(stateFile);
   const bridge = createBridge(config, state);
@@ -40,7 +41,7 @@ test('catalog fallback preserves client and account lists across outages and res
   });
   await new Promise((resolve) => bridge.server.listen(0, '127.0.0.1', resolve));
   async function catalog(version, account = 'account-a', server = bridge.server) {
-    const response = await fetch(`http://127.0.0.1:${server.address().port}/backend-api/codex/models?client_version=${version}`, {
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/${localAuth.token}/backend-api/codex/models?client_version=${version}`, {
       headers: { authorization: 'Bearer test', 'chatgpt-account-id': account },
     });
     return { status: response.status, data: await response.json() };

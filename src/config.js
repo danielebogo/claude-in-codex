@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { prepareLocalAuth } from './localAuth.js';
 
 export const BRIDGE_HOME =
   process.env.CODEX_CLAUDE_BRIDGE_HOME || path.join(os.homedir(), '.codex-claude-bridge');
@@ -104,7 +105,7 @@ export const DEFAULTS = {
   codexComputerUseMcpConfig: findCodexComputerUseMcpConfig(),
   // Seconds between keep-alive events while Claude works silently.
   keepAliveSeconds: 15,
-  // Set to a directory to dump sanitized request bodies for debugging.
+  // Set to a private directory for bounded structural metadata only; no prompt content.
   debugDumpDir: null,
   logLevel: 'info',
 };
@@ -124,6 +125,7 @@ export function loadConfig() {
     ...user,
     models: modelsFromConfig(user),
     permissionModes: { ...DEFAULTS.permissionModes, ...(user.permissionModes || {}) },
+    localAuth: prepareLocalAuth(BRIDGE_HOME),
   };
   if (process.env.CODEX_CLAUDE_BRIDGE_PORT) config.port = Number(process.env.CODEX_CLAUDE_BRIDGE_PORT);
   if (process.env.CODEX_CLAUDE_BRIDGE_UPSTREAM) config.upstream = process.env.CODEX_CLAUDE_BRIDGE_UPSTREAM;

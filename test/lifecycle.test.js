@@ -1,3 +1,4 @@
+import { localAuth, securePath } from './fixtures/local-auth.js';
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
@@ -55,7 +56,7 @@ before(async () => {
   });
   await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
   const config = {
-    ...DEFAULTS,
+    ...DEFAULTS, localAuth,
     upstream: `http://127.0.0.1:${upstream.address().port}/backend-api/codex`,
     claudePath: fakeClaude,
     codexComputerUseMcpConfig: null,
@@ -88,7 +89,7 @@ const body = (model, input, extra = {}) => JSON.stringify({ model, instructions:
 
 function request(pathname, { method = 'POST', payload, headers = {} } = {}) {
   return new Promise((resolve, reject) => {
-    const req = http.request({ host: '127.0.0.1', port, path: pathname, method, headers: { 'content-type': 'application/json', ...headers } }, (res) => {
+    const req = http.request({ host: '127.0.0.1', port, path: securePath(pathname), method, headers: { 'content-type': 'application/json', ...headers } }, (res) => {
       let data = '';
       res.on('data', (chunk) => (data += chunk));
       res.on('end', () => resolve({ status: res.statusCode, data }));
@@ -163,7 +164,7 @@ function webSocketTurn(socket, frame) {
 }
 
 async function openSocket(headers = {}) {
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/backend-api/codex/responses`, { headers });
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/${localAuth.token}/backend-api/codex/responses`, { headers });
   await new Promise((resolve, reject) => { socket.once('open', resolve); socket.once('error', reject); });
   return socket;
 }

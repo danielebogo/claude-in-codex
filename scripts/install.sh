@@ -3,6 +3,7 @@
 #  - background service (LaunchAgent) on 127.0.0.1:18787
 #  - points Codex at it with one line in ~/.codex/config.toml (backed up first)
 set -euo pipefail
+umask 077
 
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PORT="${CODEX_CLAUDE_BRIDGE_PORT:-18787}"
@@ -15,6 +16,8 @@ TAG="# codex-claude-bridge"
 
 say() { printf '\033[1m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[31mError:\033[0m %s\n' "$*" >&2; exit 1; }
+
+[[ "$PORT" =~ ^[0-9]{1,5}$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "CODEX_CLAUDE_BRIDGE_PORT must be an integer from 1 to 65535."
 
 # --- find node and claude (login shell so nvm/homebrew PATHs are loaded) -------
 NODE="$(command -v node || true)"
@@ -49,6 +52,7 @@ touch "$CODEX_CONFIG"
 
 # --- bridge config -------------------------------------------------------------
 mkdir -p "$BRIDGE_HOME" "$(dirname "$PLIST")" "$(dirname "$LOG")"
+"$NODE" "$DIR/scripts/bridge-endpoint.js" prepare "$BRIDGE_HOME"
 if [ ! -f "$BRIDGE_HOME/config.json" ]; then
   cat > "$BRIDGE_HOME/config.json" <<JSON
 {
@@ -114,16 +118,16 @@ fi
 say "service started (logs: $LOG)"
 
 for i in $(seq 1 20); do
-  if curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then break; fi
+  if "$NODE" "$DIR/scripts/bridge-endpoint.js" verify "$BRIDGE_HOME" "$PORT" >/dev/null 2>&1; then break; fi
   sleep 0.5
 done
-curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null || die "bridge didn't start; see $LOG"
+"$NODE" "$DIR/scripts/bridge-endpoint.js" verify "$BRIDGE_HOME" "$PORT" || die "bridge identity could not be verified; Codex route unchanged; see $LOG"
 say "bridge healthy on http://127.0.0.1:$PORT"
 
 # --- Codex config ------------------------------------------------------------------
 mkdir -p "$(dirname "$CODEX_CONFIG")"
 touch "$CODEX_CONFIG"
-"$NODE" "$DIR/scripts/configure-route.js" "$CODEX_CONFIG" "http://127.0.0.1:$PORT/backend-api/codex"
+"$NODE" "$DIR/scripts/configure-route.js" "$CODEX_CONFIG" "http://127.0.0.1:$PORT/backend-api/codex" local "$BRIDGE_HOME"
 say "configured selected Codex provider"
 
 if [ "$HAS_ZSTD" != "true" ] && ! grep -q "enable_request_compression" "$CODEX_CONFIG"; then

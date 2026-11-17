@@ -3,6 +3,7 @@
 // the original standard ChatGPT URL on uninstall. Used by install/uninstall.sh.
 import fs from 'node:fs';
 import { pathToFileURL } from 'node:url';
+import { readLocalAuth } from '../src/localAuth.js';
 
 export function configureRoute(text, url, remove = false) {
   const lines = text.split('\n');
@@ -42,12 +43,21 @@ export function configureRoute(text, url, remove = false) {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href) {
-  const [file, url, mode] = process.argv.slice(2);
+  const [file, route, mode, bridgeHome] = process.argv.slice(2);
+  let url = route;
+  if (mode === 'local') {
+    const auth = readLocalAuth(bridgeHome);
+    const endpoint = new URL(route);
+    endpoint.pathname = `/${auth.token}${endpoint.pathname}`;
+    url = endpoint.href;
+  }
   const original = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
   const updated = configureRoute(original, url, mode === 'remove');
   if (mode !== 'check' && updated !== original) {
     if (fs.readFileSync(file, 'utf8') !== original) throw new Error('Codex config changed during setup; retry without overwriting it.');
-    fs.copyFileSync(file, `${file}.bak-ccb-${Date.now()}`);
+    const backup = `${file}.bak-ccb-${Date.now()}`;
+    fs.copyFileSync(file, backup);
+    fs.chmodSync(backup, 0o600);
     fs.writeFileSync(`${file}.ccb-tmp`, updated, { mode: 0o600 });
     fs.renameSync(`${file}.ccb-tmp`, file);
   }

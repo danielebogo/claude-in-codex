@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import http from 'node:http';
 import crypto from 'node:crypto';
-import zlib from 'node:zlib';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -16,6 +15,11 @@ import { runClaudeTurn, compactSession, claudeCapabilities, hasActiveClaudeTurns
 import { mergeCatalog, fallbackGptModel } from './catalog.js';
 import { findCodexResults, cancelWaitingCodexTurns, cancelCodexTurns, waitingCodexTurns, waitingCodexTurnsReferencedBy } from './codexTools.js';
 import { diagnostics, diagnosticsSnapshot, logLifecycle, startResourceMonitor } from './diagnostics.js';
+import { validateLocalAuth, authenticatedPath, healthProof } from './localAuth.js';
+import { DEFAULT_LIMITS, RequestError, readBody, decodeBody } from './requestLimits.js';
+import { createDebugDumper } from './debugDumps.js';
+
+export { decodeBody } from './requestLimits.js';
 
 const HOP_BY_HOP = new Set([
   'host',
@@ -39,22 +43,14 @@ function makeLogger(level) {
   };
 }
 
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    req.on('data', (c) => chunks.push(c));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
-}
-
 // ResponsesStream writes complete SSE events. This adapter sends the same event
 // JSON over a WebSocket for Claude turns, including model switches on an open socket.
 class WebSocketResponse extends EventEmitter {
-  constructor(socket, onCompleted) {
+  constructor(socket, onCompleted, send) {
     super();
     this.socket = socket;
     this.onCompleted = onCompleted;
+    this.send = send;
     this.writableEnded = false;
     this.writableFinished = false;
     this.destroyed = false;
@@ -74,7 +70,7 @@ class WebSocketResponse extends EventEmitter {
       const json = data.slice(6);
       const event = JSON.parse(json);
       if (event.type === 'response.completed') this.onCompleted?.(event.response); // Save context before the client can send its next delta.
-      this.socket.send(json);
+      this.send(this.socket, json, false);
     }
     return true;
   }
@@ -86,23 +82,6 @@ class WebSocketResponse extends EventEmitter {
     this.socket.off('close', this.onSocketClose);
     this.emit('close');
   }
-}
-
-export function decodeBody(raw, encoding) {
-  const enc = String(encoding || '').toLowerCase().trim();
-  if (!enc || enc === 'identity') return raw;
-  if (enc === 'zstd') {
-    if (typeof zlib.zstdDecompressSync !== 'function') {
-      throw new Error(
-        'Codex sent a zstd-compressed body but this Node has no zstd support. Use Node >= 22.15, or set `[features] enable_request_compression = false` in ~/.codex/config.toml.',
-      );
-    }
-    return zlib.zstdDecompressSync(raw);
-  }
-  if (enc === 'gzip') return zlib.gunzipSync(raw);
-  if (enc === 'br') return zlib.brotliDecompressSync(raw);
-  if (enc === 'deflate') return zlib.inflateSync(raw);
-  throw new Error(`unsupported content-encoding ${enc}`);
 }
 
 /** The Codex chat a request belongs to; Claude and GPT routes must agree so cancellation hits exactly one thread. */
@@ -139,7 +118,13 @@ export function isAgentTurn(body) {
 
 export function createBridge(initialConfig, state = new State()) {
   let config = initialConfig ?? loadConfig();
+  const auth = validateLocalAuth(config.localAuth);
+  const limits = { ...DEFAULT_LIMITS, ...config.limits };
+  for (const [name, value] of Object.entries(limits)) {
+    if (!Number.isSafeInteger(value) || value < 1) throw new Error(`Bridge limit ${name} must be a positive safe integer.`);
+  }
   const log = makeLogger(config.logLevel);
+  const debugDump = config.debugDumpDir ? createDebugDumper(config.debugDumpDir) : null;
   const claudeSlugs = new Map(config.models.map((m) => [m.slug, m]));
   let modelSnapshot = JSON.stringify(config.models);
   let warnedInvalidModels = false;
@@ -161,6 +146,8 @@ export function createBridge(initialConfig, state = new State()) {
   }
   const isClaude = (model) => claudeSlugs.has(model);
   const lastClaudeResponses = new WeakMap(); // Responses with store=false live only on their socket, never in the on-disk session index.
+  const activeWebSocketTurns = new Set(); // A slot stays reserved while a waiting native turn is stopped and replaced.
+  const pendingWebSocketReplacements = new Set();
 
   function previousResponseError(id) {
     return { type: 'invalid_request_error', code: 'previous_response_not_found', message: `Previous response with id '${id}' not found.`, param: 'previous_response_id' };
@@ -301,6 +288,7 @@ export function createBridge(initialConfig, state = new State()) {
       return;
     }
     await cancelWaitingCodexTurns(threadId, parsed.hasCompactionTrigger ? 'compaction' : 'new-request');
+    if (res.destroyed) return;
 
     if (parsed.hasCompactionTrigger) {
       // Codex wants to compact a Claude thread: compact the Claude session instead.
@@ -343,11 +331,9 @@ export function createBridge(initialConfig, state = new State()) {
 
   function dump(kind, obj) {
     try {
-      fs.mkdirSync(config.debugDumpDir, { recursive: true });
-      const file = path.join(config.debugDumpDir, `${Date.now()}-${kind}.json`);
-      fs.writeFileSync(file, JSON.stringify(obj, null, 2));
-    } catch {
-      // debugging only
+      debugDump?.(kind, obj);
+    } catch (error) {
+      log.error(`debug metadata dump failed: ${error.message}`);
     }
   }
 
@@ -372,6 +358,24 @@ export function createBridge(initialConfig, state = new State()) {
     });
   }
 
+  function closeOverloadedSocket(socket) {
+    if (socket.readyState !== WebSocket.OPEN) return;
+    socket.close(1009, 'WebSocket buffer limit exceeded');
+    const timer = setTimeout(() => socket.terminate(), 1000);
+    timer.unref();
+    socket.once('close', () => clearTimeout(timer));
+  }
+
+  function sendWebSocket(socket, data, binary) {
+    if (socket.readyState !== WebSocket.OPEN) return false;
+    if (socket.bufferedAmount + byteLength(data) > limits.maxWebSocketQueueBytes) {
+      closeOverloadedSocket(socket);
+      return false;
+    }
+    socket.send(data, { binary });
+    return true;
+  }
+
   function routeWebSocketMessage(req, client, data, isBinary, forwardGpt) {
     refreshModels();
     let body;
@@ -380,12 +384,13 @@ export function createBridge(initialConfig, state = new State()) {
     if (body?.previous_response_id && (modelCfg || body.previous_response_id.startsWith('resp_ccb_'))) {
       const previous = lastClaudeResponses.get(client);
       if (previous?.id !== body.previous_response_id) { // Reconnects or GPT-owned parents need the client to replay its full context.
-        client.send(JSON.stringify({ type: 'error', status: 400, error: previousResponseError(body.previous_response_id) }));
+        sendWebSocket(client, JSON.stringify({ type: 'error', status: 400, error: previousResponseError(body.previous_response_id) }), false);
         return;
       }
       body = { ...body, input: [...previous.input, ...(body.input || [])] };
       delete body.previous_response_id;
       data = JSON.stringify(body); // GPT switches must also send reconstructed history, not a bridge-owned response ID.
+      if (byteLength(data) > limits.maxWebSocketPayloadBytes) return closeOverloadedSocket(client);
     }
     const metadata = body?.client_metadata || {};
     const frameHeaders = { ...req.headers, 'thread-id': metadata.thread_id || req.headers['thread-id'] };
@@ -406,12 +411,17 @@ export function createBridge(initialConfig, state = new State()) {
       }
       return forwardGpt(data, isBinary, body?.model);
     }
+    const threadId = requestThreadId(frameHeaders, body);
+    let admission = null;
     const onCompleted = (response) => {
+      if (admission) admission.turn = waitingCodexTurnsReferencedBy(response.output, threadId)[0] ?? null;
+      const contextBytes = byteLength(data) + Buffer.byteLength(JSON.stringify(response.output));
+      if (contextBytes > limits.maxWebSocketPayloadBytes) { lastClaudeResponses.delete(client); diagnostics.setContextBytes(client, 0); return; }
       lastClaudeResponses.set(client, { id: response.id, input: [...(body.input || []), ...response.output] });
-      diagnostics.setContextBytes(client, byteLength(data) + Buffer.byteLength(JSON.stringify(response.output))); // Approximate: the frame that carried this context plus Claude's reply.
+      diagnostics.setContextBytes(client, contextBytes); // Bounded cache; an oversized history requires client replay.
     };
     if (body.generate === false) {
-      const stream = new ResponsesStream(new WebSocketResponse(client, onCompleted), { model: body.model });
+      const stream = new ResponsesStream(new WebSocketResponse(client, onCompleted, sendWebSocket), { model: body.model });
       stream.begin();
       stream.complete(usageObject());
       return;
@@ -428,15 +438,59 @@ export function createBridge(initialConfig, state = new State()) {
         'turn-id': metadata.turn_id || req.headers['turn-id'],
       },
     };
-    const response = new WebSocketResponse(client, onCompleted);
-    handleClaudeResponses(turnReq, response, body, modelCfg).catch((error) => {
+    const hasCompactionTrigger = Array.isArray(body.input) && body.input.some((item) => item?.type === 'compaction_trigger');
+    const isContinuation = !hasCompactionTrigger && findCodexResults(body.input, threadId);
+    const rejectCapacity = () => {
+      sendWebSocket(client, JSON.stringify({ type: 'error', status: 503, error: { message: 'Bridge Claude turn capacity reached; retry after another turn completes.' } }), false);
+    };
+    const turnFailed = (error) => {
       log.error(`Claude websocket turn crashed: ${error.stack || error}`);
       if (client.readyState === WebSocket.OPEN) client.close(1011, 'Claude turn failed');
-    });
+    };
+    function startTurn() {
+      let finished;
+      if (admission) {
+        admission.turn = null;
+        admission.settled = false;
+        admission.finished = new Promise((resolve) => { finished = resolve; });
+      }
+      const response = new WebSocketResponse(client, onCompleted, sendWebSocket);
+      handleClaudeResponses(turnReq, response, body, modelCfg).catch(turnFailed).finally(() => {
+        if (admission) admission.settled = true;
+        finished?.();
+        if (admission && !admission.replacing) activeWebSocketTurns.delete(admission);
+      });
+    }
+    if (isContinuation) return startTurn();
+    if (pendingWebSocketReplacements.has(threadId)) return rejectCapacity();
+    if (activeWebSocketTurns.size >= limits.maxConcurrentRequests) {
+      const waiting = new Set(waitingCodexTurns(threadId));
+      admission = [...activeWebSocketTurns].find((slot) => slot.threadId === threadId && !slot.replacing && waiting.has(slot.turn));
+      if (!admission) return rejectCapacity();
+      admission.replacing = true;
+      pendingWebSocketReplacements.add(threadId);
+      cancelCodexTurns([admission.turn], hasCompactionTrigger ? 'compaction' : 'new-request')
+        .then(() => admission.finished) // Child exit precedes the original handler's cleanup; keep its slot through both.
+        .then(() => {
+          if (client.readyState !== WebSocket.OPEN) { activeWebSocketTurns.delete(admission); return; }
+          admission.replacing = false;
+          startTurn();
+        })
+        .catch((error) => {
+          admission.replacing = false;
+          if (admission.settled) activeWebSocketTurns.delete(admission);
+          turnFailed(error);
+        })
+        .finally(() => pendingWebSocketReplacements.delete(threadId));
+      return;
+    }
+    admission = { threadId, turn: null, replacing: false };
+    activeWebSocketTurns.add(admission);
+    startTurn();
   }
 
+  let webSockets = 0;
   function proxyWebSocket(req, socket, head) {
-    refreshModels();
     socket.on('error', (error) => {
       log.error(`websocket connection failed: ${error.message}`);
       socket.destroy(); // A client can disconnect during a rejected upgrade; the October 2 EPIPE otherwise killed the whole bridge.
@@ -444,7 +498,13 @@ export function createBridge(initialConfig, state = new State()) {
     const denied = localOnly(req);
     if (denied) return rejectWebSocket(socket, '403 Forbidden');
     const url = new URL(req.url, 'http://127.0.0.1');
-    if (url.pathname !== `${BASE_PATH}/responses`) return rejectWebSocket(socket, '404 Not Found');
+    const pathname = authenticatedPath(url.pathname, auth.token);
+    if (pathname === null) return rejectWebSocket(socket, '401 Unauthorized');
+    if (pathname !== `${BASE_PATH}/responses`) return rejectWebSocket(socket, '404 Not Found');
+    refreshModels();
+    if (webSockets >= limits.maxWebSockets) return rejectWebSocket(socket, '503 Service Unavailable');
+    webSockets++;
+    socket.once('close', () => { webSockets--; });
 
     // Some Codex clients omit the model hint, even in current prewarm requests.
     // Accept the socket and route its frames by model instead of making those
@@ -453,13 +513,21 @@ export function createBridge(initialConfig, state = new State()) {
     if (!model || isClaude(model)) {
       // A fresh side chat can start with Claude, or omit the hint entirely.
       // Open GPT lazily if a frame on this socket needs it.
-      const wss = new WebSocketServer({ noServer: true, perMessageDeflate: true });
+      const wss = new WebSocketServer({ noServer: true, perMessageDeflate: true, maxPayload: limits.maxWebSocketPayloadBytes });
       wss.handleUpgrade(req, socket, head, (client) => {
         watchClientWebSocket(client);
         log.info(`local routed websocket model=${model || 'unhinted'}`);
         let upstream;
         const pendingGpt = [];
+        let pendingBytes = 0;
         const forwardGpt = (data, isBinary, frameModel) => {
+          if (client.readyState !== WebSocket.OPEN) return;
+          if (byteLength(data) > limits.maxWebSocketQueueBytes || pendingBytes + byteLength(data) > limits.maxWebSocketQueueBytes || pendingGpt.length >= limits.maxWebSocketQueueMessages) {
+            pendingGpt.length = 0;
+            pendingBytes = 0;
+            upstream?.terminate();
+            return closeOverloadedSocket(client);
+          }
           if (!upstream) {
             const target = new URL(`${config.upstream}/responses${url.search}`);
             target.protocol = target.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -467,13 +535,14 @@ export function createBridge(initialConfig, state = new State()) {
             for (const key of Object.keys(headers)) {
               if (['host', 'connection', 'upgrade', 'sec-websocket-key', 'sec-websocket-version', 'sec-websocket-extensions'].includes(key)) delete headers[key];
             }
-            upstream = new WebSocket(target, { headers, perMessageDeflate: true, handshakeTimeout: 15000 });
+            upstream = new WebSocket(target, { headers, perMessageDeflate: true, maxPayload: limits.maxWebSocketPayloadBytes, handshakeTimeout: 15000 });
             diagnostics.trackSocket(upstream, 'upstream');
             upstream.on('open', () => {
-              for (const queued of pendingGpt.splice(0)) upstream.send(queued.data, { binary: queued.isBinary });
+              for (const queued of pendingGpt.splice(0)) sendWebSocket(upstream, queued.data, queued.isBinary);
+              pendingBytes = 0;
             });
             upstream.on('message', (message, binary) => {
-              if (client.readyState === WebSocket.OPEN) client.send(message, { binary });
+              sendWebSocket(client, message, binary);
             });
             upstream.on('error', (error) => {
               log.error(`GPT websocket upstream failed: ${error.message}`);
@@ -481,11 +550,11 @@ export function createBridge(initialConfig, state = new State()) {
             });
             upstream.on('close', () => client.close());
           }
-          if (upstream.readyState === WebSocket.OPEN) upstream.send(data, { binary: isBinary });
-          else pendingGpt.push({ data, isBinary });
+          if (upstream.readyState === WebSocket.OPEN) sendWebSocket(upstream, data, isBinary);
+          else if (upstream.readyState === WebSocket.CONNECTING) { pendingGpt.push({ data, isBinary }); pendingBytes += byteLength(data); }
         };
         client.on('message', (data, isBinary) => routeWebSocketMessage(req, client, data, isBinary, forwardGpt));
-        client.on('close', () => upstream?.terminate());
+        client.on('close', () => { pendingGpt.length = 0; pendingBytes = 0; upstream?.terminate(); });
       });
       return;
     }
@@ -497,13 +566,13 @@ export function createBridge(initialConfig, state = new State()) {
       if (['host', 'connection', 'upgrade', 'sec-websocket-key', 'sec-websocket-version', 'sec-websocket-extensions'].includes(key)) delete headers[key];
     }
     socket.pause();
-    const upstream = new WebSocket(target, { headers, perMessageDeflate: true, handshakeTimeout: 15000 });
+    const upstream = new WebSocket(target, { headers, perMessageDeflate: true, maxPayload: limits.maxWebSocketPayloadBytes, handshakeTimeout: 15000 });
     diagnostics.trackSocket(upstream, 'upstream');
     let upstreamResponse;
     let client;
     upstream.on('upgrade', (response) => { upstreamResponse = response; });
     upstream.on('open', () => {
-      const wss = new WebSocketServer({ noServer: true, perMessageDeflate: true });
+      const wss = new WebSocketServer({ noServer: true, perMessageDeflate: true, maxPayload: limits.maxWebSocketPayloadBytes });
       wss.on('headers', (responseHeaders) => {
         // Keep Codex's routing and capability headers; ws creates its own handshake headers.
         for (let i = 0; i < upstreamResponse.rawHeaders.length; i += 2) {
@@ -518,9 +587,9 @@ export function createBridge(initialConfig, state = new State()) {
         watchClientWebSocket(client);
         log.info(`proxied GPT websocket model=${model}`);
         socket.resume();
-        client.on('message', (data, isBinary) => routeWebSocketMessage(req, client, data, isBinary, (message, binary) => upstream.send(message, { binary })));
+        client.on('message', (data, isBinary) => routeWebSocketMessage(req, client, data, isBinary, (message, binary) => sendWebSocket(upstream, message, binary)));
         upstream.on('message', (data, isBinary) => {
-          if (client.readyState === WebSocket.OPEN) client.send(data, { binary: isBinary });
+          sendWebSocket(client, data, isBinary);
         });
         client.on('close', () => upstream.close());
         upstream.on('close', () => client.close());
@@ -538,44 +607,54 @@ export function createBridge(initialConfig, state = new State()) {
     socket.on('close', () => upstream.terminate());
   }
 
-  async function handle(req, res) {
+  async function handle(req, res, inputProcessed) {
     const denied = localOnly(req);
     if (denied) {
       res.writeHead(403);
       return res.end();
     }
-    refreshModels();
     const url = new URL(req.url, 'http://127.0.0.1');
     if (url.pathname === '/health') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      const challenge = url.searchParams.get('challenge');
+      return res.end(JSON.stringify(/^[a-f0-9]{64}$/.test(challenge || '') ? healthProof(auth, challenge, req.socket.localPort) : { ok: true }));
+    }
+    const pathname = authenticatedPath(url.pathname, auth.token);
+    if (pathname === null) {
+      res.writeHead(401, { connection: 'close' });
+      return res.end();
+    }
+    refreshModels();
+    if (pathname === '/health') {
       res.writeHead(200, { 'content-type': 'application/json' });
       // Counts, sizes, IDs and ages only: running/waiting Claude processes, sockets, cached context and state writes.
       return res.end(JSON.stringify({ ok: true, models: config.models.map((m) => m.slug), diagnostics: diagnosticsSnapshot({ state }) }));
     }
-    if (!url.pathname.startsWith(BASE_PATH)) {
+    if (pathname !== BASE_PATH && !pathname.startsWith(`${BASE_PATH}/`)) {
       res.writeHead(404);
       return res.end();
     }
-    const subpath = url.pathname.slice(BASE_PATH.length) || '/';
+    const subpath = pathname.slice(BASE_PATH.length) || '/';
     const query = url.search || '';
 
     if (req.method === 'GET' && subpath === '/models') return handleModels(req, res, subpath, query);
     if (req.method === 'GET' || req.method === 'HEAD') return passthrough(req, res, subpath, query, undefined);
 
-    const raw = await readBody(req);
+    const raw = await readBody(req, { maxBytes: limits.maxBodyBytes, timeoutMs: limits.bodyTimeoutMs });
+    if (res.destroyed) return;
     const encoding = req.headers['content-encoding'];
+    const decoded = await decodeBody(raw, encoding, limits.maxDecodedBytes);
+    if (res.destroyed) return;
     let body = null;
     const isJson = String(req.headers['content-type'] || '').includes('json');
     if (isJson) {
       try {
-        body = JSON.parse(decodeBody(raw, encoding).toString('utf8'));
+        body = JSON.parse(decoded.toString('utf8'));
       } catch (err) {
         log.error(`could not read ${subpath} body: ${err.message}`);
-        if (/zstd/.test(err.message)) {
-          res.writeHead(500, { 'content-type': 'application/json' });
-          return res.end(JSON.stringify({ error: { message: err.message } }));
-        }
       }
     }
+    inputProcessed(); // A tool handoff can close this response while its native process waits for the next request.
     if (!body) return passthrough(req, res, subpath, query, raw);
     if (config.debugDumpDir && subpath.startsWith('/responses')) dump('request', { subpath, body });
 
@@ -615,20 +694,41 @@ export function createBridge(initialConfig, state = new State()) {
     return passthrough(req, res, subpath, query, raw);
   }
 
+  let activeRequests = 0;
   const server = http.createServer((req, res) => {
+    if (activeRequests >= limits.maxConcurrentRequests) {
+      res.writeHead(503, { connection: 'close' });
+      return res.end(JSON.stringify({ error: { message: 'Bridge request capacity reached; retry after another request completes.' } }));
+    }
+    activeRequests++;
     diagnostics.requestStarted();
-    res.once('close', () => diagnostics.requestFinished());
-    handle(req, res).catch((err) => {
+    let responseClosed = false;
+    let processingFinished = false;
+    let capacityReleased = false;
+    function releaseCapacity() {
+      if (capacityReleased || !responseClosed || !processingFinished) return;
+      capacityReleased = true;
+      activeRequests--;
+      diagnostics.requestFinished();
+    }
+    function inputProcessed() {
+      processingFinished = true;
+      releaseCapacity();
+    }
+    res.once('close', () => { responseClosed = true; releaseCapacity(); });
+    handle(req, res, inputProcessed).catch((err) => {
       log.error(`request failed: ${err.stack || err}`);
-      if (!res.headersSent) res.writeHead(500);
-      res.end();
-    });
+      if (res.destroyed) return;
+      if (!res.headersSent) res.writeHead(err instanceof RequestError ? err.status : 500, { 'content-type': 'application/json', connection: 'close' });
+      if (!req.complete) res.once('finish', () => req.destroy());
+      res.end(JSON.stringify({ error: { message: err instanceof RequestError ? err.message : 'Bridge request failed; check the bridge log.' } }));
+    }).finally(inputProcessed);
   });
 
   server.on('upgrade', proxyWebSocket);
 
-  server.requestTimeout = 0;
-  server.headersTimeout = 60000;
+  server.requestTimeout = limits.bodyTimeoutMs;
+  server.headersTimeout = Math.min(60000, limits.bodyTimeoutMs);
   server.keepAliveTimeout = 65000;
 
   return { server, log, config, state };

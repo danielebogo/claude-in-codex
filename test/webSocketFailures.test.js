@@ -1,3 +1,4 @@
+import { localAuth } from './fixtures/local-auth.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -11,7 +12,7 @@ async function startBridge(t, injectBrokenPipe = false, upstream) {
     import { createBridge } from ${JSON.stringify(new URL('../src/server.js', import.meta.url).href)};
     import { DEFAULTS } from ${JSON.stringify(new URL('../src/config.js', import.meta.url).href)};
     import { EventEmitter } from 'node:events';
-    const { server } = createBridge({ ...DEFAULTS, logLevel: 'error', upstream: ${JSON.stringify(upstream)} ?? DEFAULTS.upstream });
+    const { server } = createBridge({ ...DEFAULTS, localAuth: ${JSON.stringify(localAuth)}, logLevel: 'error', upstream: ${JSON.stringify(upstream)} ?? DEFAULTS.upstream });
     server.listen(0, '127.0.0.1', () => {
       console.log(JSON.stringify({ port: server.address().port }));
       if (${injectBrokenPipe}) {
@@ -56,7 +57,7 @@ for (const route of ['unhinted', 'GPT']) test(`a malformed ${route} WebSocket cl
   await once(socket, 'connect');
   const upgraded = once(socket, 'data');
   const hint = route === 'GPT' ? 'x-codex-routing-hint: model=gpt-test\r\n' : '';
-  socket.write(`GET /backend-api/codex/responses HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n${hint}\r\n`);
+  socket.write(`GET /${localAuth.token}/backend-api/codex/responses HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n${hint}\r\n`);
   assert.match((await upgraded)[0].toString(), /101 Switching Protocols/);
   const disconnected = once(socket, 'close');
   socket.write(Buffer.from([0x81, 0x02, 0x4f, 0x4b])); // Real clients must mask frames; a damaged client previously emitted an unhandled WebSocket error.
