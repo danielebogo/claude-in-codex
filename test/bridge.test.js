@@ -1320,3 +1320,25 @@ test('GPT requests keep bridge-made Codex tool calls, without their bridge ids',
   assert.deepEqual(input.map((item) => item.id), [undefined, undefined, undefined]);
   assert.deepEqual(input.map((item) => item.call_id), ['call_ccb_1', 'call_ccb_1', 'call_ccb_2']);
 });
+
+test('a discovered model without effort support runs without an effort flag from its catalog default', async (t) => {
+  const model = bridge.config.models[0];
+  const original = model.reasoningEfforts;
+  model.reasoningEfforts = [];
+  t.after(() => {
+    if (original === undefined) delete model.reasoningEfforts;
+    else model.reasoningEfforts = original;
+  });
+  const catalogResponse = await request('/backend-api/codex/models', { method: 'GET' });
+  const catalog = JSON.parse(catalogResponse.data).models.find((entry) => entry.slug === model.slug);
+
+  const result = await request('/backend-api/codex/responses', {
+    body: responsesBody(model.slug, [envContext(workdir), userMsg('no effort model')], { reasoning: { effort: catalog.default_reasoning_level } }),
+    headers: { 'content-type': 'application/json' },
+  });
+
+  assert.equal(result.status, 200);
+  assert.ok(parseSse(result.data).some((event) => event.type === 'response.completed'));
+  assert.deepEqual(catalog.supported_reasoning_levels, []);
+  assert.equal(readClaudeLog().at(-1).args.includes('--effort'), false);
+});

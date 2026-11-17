@@ -11,3 +11,6 @@
 - Grok ACP resumes through a fresh native process. Loading an already-open session in the same ACP process can stall, and deferred MCP calls can use a use_tool wrapper whose real tool identity arrives in later sparse updates.
 - Verify provider telemetry through response.completed, not only the CLI adapter. Preserve observed totals and sparse/final usage even without assistant output; do not infer missing token components or reuse Claude-specific cache arithmetic for another provider.
 - Decode UTF-8 incrementally across stdin pipe chunks and enforce input limits on raw bytes. Regression tests must control chunk boundaries so a multibyte character actually spans separate reads.
+
+- A supported optional provider must not require another provider's CLI. Discover catalogs through bounded metadata-only handshakes, preserve manual and hidden historical routes, and isolate installer tests from real provider binaries and the user's home directory.
+- Validate provider readiness under the background service's credential environment, not shell-only overrides. Carry discovered model capabilities through request execution: an empty effort list must suppress the native effort flag, including Codex's default none.

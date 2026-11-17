@@ -189,7 +189,9 @@ export async function runClaudeTurn({ config, state, stream, parsed, modelCfg, e
     if (caps.partial) args.push('--include-partial-messages');
     if (caps.permissionPrompts) args.push('--permission-prompts', 'none');
     const requestedEffort = EFFORT[String(effort || '').toLowerCase()];
-    const effortLevel = provider === 'grok' && requestedEffort === 'max' ? 'xhigh' : requestedEffort;
+    const nativeEffort = provider === 'grok' && requestedEffort === 'max' ? 'xhigh' : requestedEffort;
+    // CLI-wide flag support does not mean every model accepts that effort.
+    const effortLevel = modelCfg.reasoningEfforts && !modelCfg.reasoningEfforts.includes(nativeEffort) ? undefined : nativeEffort;
     if (caps.effort && effortLevel) args.push('--effort', effortLevel);
     if (parsed.resume) args.push('--resume', parsed.resume.sid);
     if (parsed.fork) args.push('--fork-session');

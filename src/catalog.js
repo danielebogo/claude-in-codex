@@ -29,14 +29,17 @@ export function claudeEntries(config, state, template, maxPriority = 0) {
   return config.models.map((m, i) => {
     const entry = structuredClone(base);
     const isGrok = m.provider === 'grok';
+    const efforts = m.reasoningEfforts === undefined
+      ? EFFORT_LEVELS.filter((level) => !isGrok || level.effort !== 'max')
+      : EFFORT_LEVELS.filter((level) => m.reasoningEfforts.includes(level.effort));
     const contextWindow = state.contextWindow(m.slug) || m.contextWindow || (isGrok ? 256000 : config.defaultContextWindow);
     Object.assign(entry, {
       slug: m.slug,
       display_name: m.displayName,
       description: m.description,
-      default_reasoning_level: m.defaultEffort || 'high',
-      supported_reasoning_levels: isGrok ? EFFORT_LEVELS.filter((level) => level.effort !== 'max') : EFFORT_LEVELS,
-      visibility: m.hidden ? 'hide' : 'list', // Retired versions still route existing chats without keeping an old button in the picker or bar.
+      default_reasoning_level: efforts.find((level) => level.effort === m.defaultEffort)?.effort || efforts.find((level) => level.effort === 'high')?.effort || efforts[0]?.effort || 'none',
+      supported_reasoning_levels: efforts,
+      visibility: m.hidden || m.discoveryHidden ? 'hide' : 'list', // Retired versions still route existing chats without keeping an old button in the picker or bar.
       supported_in_api: true,
       priority: (m.priority ?? maxPriority + 1 + i),
       upgrade: null,

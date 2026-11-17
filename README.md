@@ -1,10 +1,11 @@
 # claude-in-codex
 
-**Use Claude models inside the OpenAI Codex app.** Claude models appear in Codex's model picker next to GPT. Pick one, and that chat runs on your own **Claude Code CLI**, covered by your Claude subscription. GPT requests still use your ChatGPT login, but pass through the local bridge.
+**Use Claude and Grok models inside the OpenAI Codex app.** The installer detects your signed-in **Claude Code** and **Grok** CLIs and adds their model catalogs next to GPT. Pick a model and that chat runs through its local CLI using your existing login. GPT requests still use your ChatGPT login, through the local bridge.
 
 ```
 Codex app ──► 127.0.0.1:18787 ──┬─ GPT model    → chatgpt.com over WebSocket or HTTP (your ChatGPT login)
-                                └─ Claude model → `claude -p` in the chat's project folder (your Claude login)
+                                ├─ Claude model → `claude -p` (your Claude login)
+                                └─ Grok model   → `grok agent stdio` (your Grok login)
                                                    └─ Codex's own tools, run by Codex (see below)
 ```
 
@@ -26,24 +27,24 @@ Claude Code does all the work: its own agent loop, tools, CLAUDE.md, skills and 
 
 - macOS (the installer uses a LaunchAgent; see [Other platforms](#other-platforms))
 - The **Codex** app (or Codex CLI), signed in with ChatGPT
-- **Claude Code** installed and signed in: `claude auth login`
+- At least one provider CLI installed and signed in: **Claude Code** (`claude auth login`) or **Grok Build** (`grok`). You can use Grok without installing Claude.
 - **Node.js 22.15+** (Node 20+ works too; the installer then turns off Codex's request compression, which older Node can't decode)
 
 ## Setup
 
 ```bash
-git clone https://github.com/EthanSK/claude-in-codex.git
-cd claude-in-codex
-./scripts/install.sh
+git clone https://github.com/danielebogo/claude-in-codex.git && ./claude-in-codex/scripts/install.sh
 ```
 
-Then **quit Codex completely (Cmd+Q) and reopen it**. Open the model picker: your Claude models are listed after the GPT ones. Pick one and send a message.
+Already cloned? Run just `./scripts/install.sh` from the checkout. No model JSON editing or separate Grok setup in the bridge is needed.
+
+Then **quit Codex completely (Cmd+Q) and reopen it**. Open the model picker: the detected Claude/Grok models are listed after GPT. Pick one and send a message. Provider installation and login are prerequisites; setup reports a missing or logged-out CLI and can continue with another ready provider. If neither is ready, it stops before changing the service or Codex route.
 
 The installer:
 
-1. Finds `node` and `claude`.
+1. Finds `node` and any installed Claude/Grok CLIs, including configured executable paths and common installation locations.
 2. Installs the bridge's Node dependency with `npm ci`.
-3. Writes `~/.codex-claude-bridge/config.json`.
+3. Reads each ready CLI's model catalog without sending a prompt, then writes `~/.codex-claude-bridge/config.json`. Claude aliases are pinned to their resolved model IDs (update older CLIs that omit these); Grok uses the ACP model IDs and capabilities.
 4. Starts a background service on `127.0.0.1:18787` that runs at login and restarts if it crashes. Logs go to `~/Library/Logs/codex-claude-bridge.log`.
 5. Backs up `~/.codex/config.toml`, then configures the selected provider. The built-in OpenAI provider gets one line at the top:
    ```toml
@@ -58,25 +59,28 @@ When upgrading from a version without local authentication, rerun the installer 
 
 **Uninstall:** `./scripts/uninstall.sh` stops the service and removes that line. Restart Codex afterwards.
 
-### Optional Grok provider
+### Provider discovery and optional configuration
 
 The bridge can also run Grok Build through its existing Grok login. Install and sign in to the official `grok` CLI separately. No API key is required by this adapter: it requests cached-token authentication and removes `XAI_API_KEY` from the child environment. Access and usage remain governed by your Grok account; a successful login or model listing does not establish your remaining quota.
 
-Keep your existing Claude entries in the `models` array of `~/.codex-claude-bridge/config.json` and append:
+Rerun `./scripts/install.sh` after installing or signing into another provider, or when you want to refresh the available models. Discovery runs during installation, rather than polling or restarting a running bridge. It preserves unrelated settings, custom routes, custom slugs, and explicit `hidden` flags. Routes added by discovery use `discovered: true`; when no longer listed, they remain routable for existing chats with `discoveryHidden: true`, which hides their picker entry until discovery finds them again. Retired default routes such as Fable 5.1 remain hidden.
+
+Discovery uses Claude's persistent CLI login, ignoring terminal-only authentication and routing overrides that the background service would not inherit. Discovery reads metadata only. It does not send paid model prompts or test your remaining quota. Grok's fast variant appears as a separate choice if the CLI lists it; setup never selects it automatically. Context size and reasoning levels reported by the CLI are carried into the catalog.
+
+You can still edit the `models` array in `~/.codex-claude-bridge/config.json` for manual routes. Entries without `provider` remain Claude entries and accept the legacy `claudeModel` field. Explicit entries use `provider` (`claude` or `grok`) and `model`. A custom example is:
 
 ```json
 {
-  "slug": "grok-4.7",
-  "displayName": "Grok 4.7",
+  "slug": "my-grok",
+  "displayName": "My Grok 4.7",
   "provider": "grok",
-  "model": "grok-4.7",
-  "description": "Grok 4.7 through your Grok Build login."
+  "model": "grok-4.7"
 }
 ```
 
-If you currently use the default model list, copy the entries from `src/models.json` into your `models` array first. `models` replaces that default list. Set `grokPath` to the absolute path printed by `command -v grok` when running under launchd, whose PATH can differ from your terminal. Provider entries without `provider` remain Claude entries and keep accepting the existing `claudeModel` field. Explicit entries use `provider` and `model`.
+`models` replaces the source defaults. The installer merges discovery into the effective list without duplicating a provider/model already represented by a manual route. A slug collision with another native model stops installation instead of reassigning that route. A live slug cannot change provider; add another slug and hide the old entry instead.
 
-Grok routes are opt-in; the default Claude catalog stays unchanged. The initial Grok route targets 4.7, with a 256,000-token advertised context and low/medium/high/xhigh reasoning. Fast models are not selected automatically. Model-data edits use the existing hot reload; changing an executable path needs an idle bridge restart. A live model slug cannot be reassigned to another provider: add a new slug and hide the old entry instead.
+Use `claudePath` or `grokPath` in that config, or `CODEX_CLAUDE_BRIDGE_CLAUDE` / `CODEX_CLAUDE_BRIDGE_GROK` during installation, for executables in custom locations. Model-data edits hot reload; changing executable paths needs an idle bridge restart. Reinstalling restarts the service, so refresh while chats are idle.
 
 The internal Grok adapter speaks ACP on stdin/stdout, translates its events into the shared native-turn stream, and supplies Codex MCP tools per session. Grok's native permission decisions are handled without interactive prompts; read-only/plan, workspace and full-access requests select the corresponding Grok sandbox profile. Codex-run tools continue through Codex's own approvals. Unknown permission requests are denied. Grok authentication errors stay on the Grok route and never reroute the prompt to Claude or GPT. Housekeeping calls still use GPT.
 

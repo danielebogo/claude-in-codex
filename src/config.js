@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { prepareLocalAuth } from './localAuth.js';
+import { modelsFromConfig } from './modelConfig.js';
 
 export const BRIDGE_HOME =
   process.env.CODEX_CLAUDE_BRIDGE_HOME || path.join(os.homedir(), '.codex-claude-bridge');
@@ -20,22 +21,6 @@ function readUserConfig() {
     if (error.code === 'ENOENT') return {};
     throw error;
   }
-}
-
-function modelsFromConfig(user) {
-  const models = user.models === undefined ? JSON.parse(fs.readFileSync(new URL('./models.json', import.meta.url), 'utf8')) : user.models;
-  const slugs = new Set();
-  if (!Array.isArray(models)) throw new Error('Expected a model list');
-  for (const model of models) {
-    const provider = model?.provider ?? 'claude';
-    const nativeModel = model?.model ?? (provider === 'claude' ? model?.claudeModel : undefined);
-    if (!model || !['claude', 'grok'].includes(provider) || ['slug', 'displayName'].some((key) => typeof model[key] !== 'string' || !model[key].trim()) || typeof nativeModel !== 'string' || !nativeModel.trim() || slugs.has(model.slug)) {
-      throw new Error('Each model needs a unique slug, displayName, supported provider (claude or grok), and native model (model, or legacy claudeModel).');
-    }
-    if (model.hidden !== undefined && typeof model.hidden !== 'boolean') throw new Error('Model hidden must be a boolean');
-    slugs.add(model.slug);
-  }
-  return models;
 }
 
 /** Reads model data again without applying unrelated service settings to active work. */

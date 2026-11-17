@@ -8,7 +8,7 @@ import { spawn } from 'node:child_process';
 import http from 'node:http';
 import { healthProof, readLocalAuth } from '../src/localAuth.js';
 
-async function isolatedInstaller(t, health = 'valid') {
+async function isolatedInstaller(t, health = 'valid', providers = ['claude'], discovery = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ccb-installer-test-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const scripts = path.join(directory, 'scripts');
@@ -16,17 +16,19 @@ async function isolatedInstaller(t, health = 'valid') {
   const home = path.join(directory, 'test-home');
   fs.mkdirSync(scripts);
   fs.mkdirSync(path.join(directory, 'src'));
-  fs.copyFileSync(new URL('../src/localAuth.js', import.meta.url), path.join(directory, 'src/localAuth.js'));
+  for (const name of ['localAuth.js', 'modelConfig.js', 'models.json']) fs.copyFileSync(new URL(`../src/${name}`, import.meta.url), path.join(directory, 'src', name));
   fs.writeFileSync(path.join(directory, 'package.json'), '{"type":"module"}');
   fs.mkdirSync(bin);
   fs.mkdirSync(path.join(home, '.codex'), { recursive: true });
-  for (const name of ['install.sh', 'uninstall.sh', 'configure-route.js', 'bridge-endpoint.js']) {
+  for (const name of ['install.sh', 'uninstall.sh', 'configure-route.js', 'bridge-endpoint.js', 'discover-models.js']) {
     const source = fs.readFileSync(new URL(`../scripts/${name}`, import.meta.url), 'utf8');
     fs.writeFileSync(path.join(scripts, name), source.replace(/\$HOME\b/g, '$TEST_INSTALLER_HOME')); // Redirect script paths in the test copy without changing HOME or touching the user's service/config.
   }
-  for (const [name, script] of Object.entries({ npm: 'exit 0', claude: 'echo "fake Claude"', launchctl: '[ "$1" != print ]', lsof: 'exit 1', curl: 'exit 0', sleep: 'exit 0' })) {
+  for (const [name, script] of Object.entries({ npm: 'exit 0', zsh: 'exit 1', launchctl: '[ "$1" != print ]', lsof: 'exit 1', curl: 'exit 0', sleep: 'exit 0' })) {
     fs.writeFileSync(path.join(bin, name), `#!/bin/sh\n${script}\n`, { mode: 0o755 });
   }
+  fs.symlinkSync(process.execPath, path.join(bin, 'node'));
+  for (const provider of providers) fs.writeFileSync(path.join(bin, provider), `#!${process.execPath}\n${fs.readFileSync(new URL('./fixtures/discovery-cli.js', import.meta.url), 'utf8')}`, { mode: 0o755 });
   const config = path.join(home, '.codex/config.toml');
   const healthRequests = [];
   const endpoint = http.createServer((req, res) => {
@@ -41,12 +43,12 @@ async function isolatedInstaller(t, health = 'valid') {
   t.after(() => { endpoint.closeAllConnections(); endpoint.close(); });
   const port = endpoint.address().port;
   const run = (name, env = {}) => new Promise((resolve, reject) => {
-    const child = spawn('/bin/bash', [path.join(scripts, name)], { env: { ...process.env, CODEX_CLAUDE_BRIDGE_PORT: String(port), TEST_INSTALLER_HOME: home, PATH: `${bin}:${process.env.PATH}`, ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn('/bin/bash', [path.join(scripts, name)], { env: { ...process.env, CODEX_CLAUDE_BRIDGE_PORT: String(port), TEST_INSTALLER_HOME: home, PATH: `${bin}:/usr/bin:/bin:/usr/sbin:/sbin`, DISCOVERY_FIXTURE: JSON.stringify(discovery), ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '', stderr = '';
     child.stdout.on('data', (data) => { stdout += data; });
     child.stderr.on('data', (data) => { stderr += data; });
     child.on('error', reject);
-    const timer = setTimeout(() => child.kill('SIGKILL'), 5000);
+    const timer = setTimeout(() => child.kill('SIGKILL'), 15000);
     child.on('close', (status) => { clearTimeout(timer); resolve({ status, stdout, stderr }); });
   });
   return { config, run, home, port, healthRequests };
@@ -108,4 +110,30 @@ for (const health of ['impostor', 'invalid-json']) test(`installer refuses ${hea
   const token = readLocalAuth(path.join(installer.home, '.codex-claude-bridge')).token;
   assert.equal(installer.healthRequests.some((url) => url.includes(token)), false);
   assert.match(result.stderr, /identity|proof|start/i);
+});
+
+for (const providers of [['grok'], ['claude', 'grok']]) test(`installer discovers ${providers.join(' and ')} without manual model config`, async (t) => {
+  const installer = await isolatedInstaller(t, 'valid', providers);
+
+  const result = await installer.run('install.sh');
+
+  assert.equal(result.status, 0, result.stderr);
+  const config = JSON.parse(fs.readFileSync(path.join(installer.home, '.codex-claude-bridge/config.json')));
+  const visible = config.models.filter((model) => !model.hidden && !model.discoveryHidden);
+  assert.deepEqual([...new Set(visible.map((model) => model.provider ?? 'claude'))].sort(), providers.slice().sort());
+  const plist = fs.readFileSync(path.join(installer.home, 'Library/LaunchAgents/com.codex-claude-bridge.plist'), 'utf8');
+  for (const provider of providers) assert.ok(plist.includes(path.dirname(config[`${provider}Path`])));
+});
+
+for (const providers of [[], ['grok']]) test('installer rejects absent or logged-out providers before changing service or route', async (t) => {
+  const installer = await isolatedInstaller(t, 'valid', providers, { grok: { loggedIn: false } });
+  const original = 'model = "gpt-test"\n';
+  fs.writeFileSync(installer.config, original);
+
+  const result = await installer.run('install.sh');
+
+  assert.notEqual(result.status, 0);
+  assert.equal(fs.readFileSync(installer.config, 'utf8'), original);
+  assert.equal(fs.existsSync(path.join(installer.home, 'Library/LaunchAgents/com.codex-claude-bridge.plist')), false);
+  assert.doesNotMatch(result.stderr, /private-token-do-not-print/);
 });
