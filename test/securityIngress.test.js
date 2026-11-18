@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { once } from 'node:events';
+import { Transform } from 'node:stream';
 import { spawn } from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
 import WebSocket, { WebSocketServer } from 'ws';
@@ -190,10 +191,12 @@ test('disconnecting during decompression retains capacity until work settles and
   let finishDecompression;
   let decodingStarted;
   const started = new Promise((resolve) => { decodingStarted = resolve; });
-  t.mock.method(zlib, 'gunzip', (_raw, _options, callback) => {
-    finishDecompression = callback;
-    decodingStarted();
-  });
+  t.mock.method(zlib, 'createGunzip', () => new Transform({
+    transform(_raw, _encoding, callback) {
+      finishDecompression = (error, data) => { if (data) this.push(data); callback(error); };
+      decodingStarted();
+    },
+  }));
   syncBuiltinESMExports();
   t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
   const request = http.request(`${bridge.url}/responses`, { method: 'POST', headers: { 'content-encoding': 'gzip', 'content-type': 'application/json' } });

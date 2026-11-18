@@ -24,16 +24,8 @@ test('RequestError preserves HTTP status and default limits are explicit', () =>
   assert.ok(error instanceof Error);
   assert.equal(error.status, 413);
   assert.equal(error.message, 'Too large');
-  assert.deepEqual(DEFAULT_LIMITS, {
-    maxBodyBytes: 32 * 1024 * 1024,
-    maxDecodedBytes: 64 * 1024 * 1024,
-    bodyTimeoutMs: 30000,
-    maxConcurrentRequests: 32,
-    maxWebSocketPayloadBytes: 32 * 1024 * 1024,
-    maxWebSocketQueueBytes: 32 * 1024 * 1024,
-    maxWebSocketQueueMessages: 64,
-    maxWebSockets: 64,
-  });
+  for (const key of ['maxBodyBytes', 'maxDecodedBytes', 'maxWebSocketPayloadBytes', 'maxWebSocketQueueBytes']) assert.equal(DEFAULT_LIMITS[key], null);
+  assert.ok(Number.isSafeInteger(DEFAULT_LIMITS.maxBufferedBytes) && DEFAULT_LIMITS.maxBufferedBytes > 0);
 });
 
 test('readBody rejects streaming overflow before the request finishes without destroying it', async () => {

@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Readable } from 'node:stream';
+import { constants as bufferConstants } from 'node:buffer';
 import { EventEmitter } from 'node:events';
 import WebSocket, { WebSocketServer } from 'ws';
 import { loadConfig, loadModelRoutes, BASE_PATH, BRIDGE_HOME } from './config.js';
@@ -19,6 +20,8 @@ import { diagnostics, diagnosticsSnapshot, logLifecycle, startResourceMonitor } 
 import { validateLocalAuth, authenticatedPath, healthProof } from './localAuth.js';
 import { DEFAULT_LIMITS, RequestError, readBody, decodeBody } from './requestLimits.js';
 import { createDebugDumper } from './debugDumps.js';
+import { ResourceBudget, webSocketResourceCeiling, withResponseLease } from './resourceBudget.js';
+import { reserveContinuation } from './continuationBudget.js';
 
 export { decodeBody } from './requestLimits.js';
 
@@ -122,8 +125,20 @@ export function createBridge(initialConfig, state = new State()) {
   const auth = validateLocalAuth(config.localAuth);
   const limits = { ...DEFAULT_LIMITS, ...config.limits };
   for (const [name, value] of Object.entries(limits)) {
+    if (['maxBodyBytes', 'maxDecodedBytes', 'maxWebSocketPayloadBytes', 'maxWebSocketQueueBytes'].includes(name) && value == null) continue;
     if (!Number.isSafeInteger(value) || value < 1) throw new Error(`Bridge limit ${name} must be a positive safe integer.`);
   }
+  const resources = new ResourceBudget(limits.maxBufferedBytes, { onPressure: (bytes) => {
+    for (const client of contextLeases.keys()) {
+      if (bytes <= resources.capacity - resources.used) break;
+      dropContext(client); // Optional replay caches must not block new work permanently.
+    }
+  } });
+  const payloadCeiling = webSocketResourceCeiling(resources.capacity, limits.maxWebSocketPayloadBytes);
+  const contextLeases = new Map();
+  const pausedSources = new WeakMap();
+  const sendCleanups = new WeakMap();
+  const continuationCredits = new Set();
   const log = makeLogger(config.logLevel);
   const debugDump = config.debugDumpDir ? createDebugDumper(config.debugDumpDir) : null;
   const claudeSlugs = new Map(config.models.map((m) => [m.slug, m]));
@@ -267,7 +282,17 @@ export function createBridge(initialConfig, state = new State()) {
     res.end(JSON.stringify({ models }));
   }
 
-  async function handleClaudeResponses(req, res, body, modelCfg) {
+  function requestResources(headers) {
+    const threadId = requestThreadId(headers);
+    const entries = [...continuationCredits];
+    const entry = entries.find((item) => threadId && item.threadId === threadId)
+      || (!threadId && entries.find((item) => !item.threadId || waitingCodexTurns(item.threadId).length));
+    // This lends memory only. Provider/session/tool-result ownership is still
+    // checked from the parsed request before any native turn can be resumed.
+    return entry?.credit?.budget || resources;
+  }
+
+  async function handleClaudeResponses(req, res, { body, modelCfg, lease }) {
     if (body.previous_response_id) { // HTTP has no connection cache; require replay rather than silently losing earlier context.
       res.writeHead(400, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: previousResponseError(body.previous_response_id) }));
@@ -289,58 +314,69 @@ export function createBridge(initialConfig, state = new State()) {
     parsed.codexTurnId = String(req.headers['turn-id'] || req.headers['x-codex-turn-id'] || crypto.randomUUID());
     parsed.fork = provider === 'claude' && Boolean(parsed.resume && differentSessionOwner);
     const stream = new ResponsesStream(res, { model: body.model });
-    stream.begin();
 
     // Codex ran tools a waiting Claude turn asked for: that same Claude process continues in this response.
     const results = findCodexResults(body.input, threadId, provider);
     if (results && !parsed.hasCompactionTrigger) { // A compact request may contain the just-finished tool result; resuming normal work here gives Codex zero compaction items.
+      stream.begin();
       results.turn.resume(stream, results);
       return;
     }
     await cancelWaitingCodexTurns(threadId, parsed.hasCompactionTrigger ? 'compaction' : 'new-request');
     if (res.destroyed) return;
 
-    if (parsed.hasCompactionTrigger) {
-      // Codex wants to compact a Claude thread: compact the Claude session instead.
-      const sid = parsed.marker?.sid;
-      if (provider === 'grok' && !sid) {
-        stream.fail('Send a normal Grok message before compacting this conversation; no Grok session has received its history yet.');
-        return;
-      }
-      let newSid = sid;
-      if (sid) {
-        stream.reasoning(`**Compacting ${provider === 'grok' ? 'Grok Build' : 'Claude Code'} context**`);
-        const keep = setInterval(() => stream.keepAlive(), config.keepAliveSeconds * 1000);
-        const toolOutputs = (body.input || []).slice((parsed.marker?.index ?? -1) + 1).filter((item) => ['function_call_output', 'custom_tool_call_output'].includes(item?.type)); // These results may not have reached the stopped native turn; retain them even when retrying a failed compact.
-        const r = await compactNativeSession({ config, sid, cwd: parsed.cwd, log, threadId, modelCfg, toolOutputs, fork: differentSessionOwner });
-        clearInterval(keep);
-        if (!r.ok) {
-          stream.fail(r.error); // A failed compaction must not replace Codex's history or claim the parent's session.
+    const credit = !parsed.hasCompactionTrigger && Array.isArray(body.tools) && body.tools.length
+      ? reserveContinuation(resources, Math.ceil(lease.bytes() * 1.25) + 64 * 1024)
+      : null;
+    const entry = credit && { threadId, credit };
+    if (entry) continuationCredits.add(entry);
+    try {
+      stream.begin();
+      if (parsed.hasCompactionTrigger) {
+        // Codex wants to compact a Claude thread: compact the Claude session instead.
+        const sid = parsed.marker?.sid;
+        if (provider === 'grok' && !sid) {
+          stream.fail('Send a normal Grok message before compacting this conversation; no Grok session has received its history yet.');
           return;
         }
-        newSid = r.sessionId;
+        let newSid = sid;
+        if (sid) {
+          stream.reasoning(`**Compacting ${provider === 'grok' ? 'Grok Build' : 'Claude Code'} context**`);
+          const keep = setInterval(() => stream.keepAlive(), config.keepAliveSeconds * 1000);
+          const toolOutputs = (body.input || []).slice((parsed.marker?.index ?? -1) + 1).filter((item) => ['function_call_output', 'custom_tool_call_output'].includes(item?.type)); // These results may not have reached the stopped native turn; retain them even when retrying a failed compact.
+          const r = await compactNativeSession({ config, sid, cwd: parsed.cwd, log, threadId, modelCfg, toolOutputs, fork: differentSessionOwner });
+          clearInterval(keep);
+          if (!r.ok) {
+            stream.fail(r.error); // A failed compaction must not replace Codex's history or claim the parent's session.
+            return;
+          }
+          newSid = r.sessionId;
+        }
+        const turnId = rid('t');
+        stream.compaction(newSid ? makeMarker(newSid, turnId, provider) : 'ccb:v1:none:none');
+        if (newSid) nativeState.recordTurn(newSid, turnId, parsed.threadId, nativeState.agentMessageIds(sid)); // Compaction does not deliver new messages, and a fork inherits only IDs already received by its parent.
+        stream.complete(usageObject());
+        return;
       }
-      const turnId = rid('t');
-      stream.compaction(newSid ? makeMarker(newSid, turnId, provider) : 'ccb:v1:none:none');
-      if (newSid) nativeState.recordTurn(newSid, turnId, parsed.threadId, nativeState.agentMessageIds(sid)); // Compaction does not deliver new messages, and a fork inherits only IDs already received by its parent.
-      stream.complete(usageObject());
-      return;
-    }
 
-    const userMessage = buildClaudeUserMessage(parsed, { newSession: !parsed.resume });
-    if (config.debugDumpDir) dump('claude-prompt', { parsed: { ...parsed, images: parsed.images.length }, userMessage });
-    await runNativeTurn({
-      config,
-      state,
-      stream,
-      parsed,
-      modelCfg,
-      effort: body.reasoning?.effort,
-      userMessage,
-      log,
-      req,
-      codexTools: body.tools,
-    });
+      const userMessage = buildClaudeUserMessage(parsed, { newSession: !parsed.resume });
+      if (config.debugDumpDir) dump('claude-prompt', { parsed: { ...parsed, images: parsed.images.length }, userMessage });
+      await runNativeTurn({
+        config,
+        state,
+        stream,
+        parsed,
+        modelCfg,
+        effort: body.reasoning?.effort,
+        userMessage,
+        log,
+        req,
+        codexTools: body.tools,
+      });
+    } finally {
+      if (entry) continuationCredits.delete(entry);
+      credit?.close();
+    }
   }
 
   function dump(kind, obj) {
@@ -364,7 +400,15 @@ export function createBridge(initialConfig, state = new State()) {
     socket.end(`HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
   }
 
+  function dropContext(client) {
+    contextLeases.get(client)?.release();
+    contextLeases.delete(client);
+    lastClaudeResponses.delete(client);
+    diagnostics.setContextBytes(client, 0);
+  }
+
   function watchClientWebSocket(client) {
+    client.once('close', () => dropContext(client));
     diagnostics.trackSocket(client, 'client');
     client.on('error', (error) => {
       log.error(`client websocket failed: ${error.message}`);
@@ -372,135 +416,181 @@ export function createBridge(initialConfig, state = new State()) {
     });
   }
 
-  function closeOverloadedSocket(socket) {
+  function closeWebSocket(socket, code, reason) {
     if (socket.readyState !== WebSocket.OPEN) return;
-    socket.close(1009, 'WebSocket buffer limit exceeded');
+    socket.close(code, reason);
+    // A source paused for a pending send must still read the close handshake.
+    socket.resume();
     const timer = setTimeout(() => socket.terminate(), 1000);
     timer.unref();
     socket.once('close', () => clearTimeout(timer));
   }
 
-  function sendWebSocket(socket, data, binary) {
-    if (socket.readyState !== WebSocket.OPEN) return false;
-    if (socket.bufferedAmount + byteLength(data) > limits.maxWebSocketQueueBytes) {
-      closeOverloadedSocket(socket);
+  function closeOverloadedSocket(socket) {
+    closeWebSocket(socket, 1009, 'WebSocket buffer limit exceeded');
+  }
+
+  function sendWebSocket(socket, data, binary, { reservation = null, source = null, budget = resources } = {}) {
+    if (socket.readyState !== WebSocket.OPEN) { reservation?.release(); return false; }
+    const bytes = byteLength(data);
+    if (limits.maxWebSocketQueueBytes != null && socket.bufferedAmount + bytes > limits.maxWebSocketQueueBytes) {
+      reservation?.release(); closeOverloadedSocket(socket); return false;
+    }
+    let lease = reservation;
+    try { lease ??= budget.acquire(bytes); }
+    catch {
+      closeWebSocket(socket, 1013, 'Bridge buffering capacity reached; retry later');
+      if (source) closeWebSocket(source, 1013, 'Bridge buffering capacity reached; retry later');
       return false;
     }
-    socket.send(data, { binary });
+    if (source) { pausedSources.set(source, (pausedSources.get(source) || 0) + 1); source.pause(); }
+    let pending = sendCleanups.get(socket);
+    if (!pending) {
+      pending = new Set(); sendCleanups.set(socket, pending);
+      socket.once('close', () => { for (const release of [...pending]) release(); sendCleanups.delete(socket); });
+    }
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true; lease.release(); pending.delete(release);
+      if (source) {
+        const remaining = (pausedSources.get(source) || 1) - 1;
+        pausedSources.set(source, remaining);
+        if (!remaining && source.readyState === WebSocket.OPEN) source.resume();
+      }
+    };
+    pending.add(release);
+    try { socket.send(data, { binary }, release); }
+    catch { release(); socket.terminate(); return false; }
     return true;
   }
 
   function routeWebSocketMessage(req, client, data, isBinary, forwardGpt) {
     refreshModels();
-    let body;
-    try { body = isBinary ? null : JSON.parse(data.toString()); } catch { body = null; }
-    const modelCfg = claudeSlugs.get(body?.model);
-    if (body?.previous_response_id && (modelCfg || body.previous_response_id.startsWith('resp_ccb_'))) {
-      const previous = lastClaudeResponses.get(client);
-      if (previous?.id !== body.previous_response_id) { // Reconnects or GPT-owned parents need the client to replay its full context.
-        sendWebSocket(client, JSON.stringify({ type: 'error', status: 400, error: previousResponseError(body.previous_response_id) }), false);
+    let lease;
+    let retained = false;
+    try {
+      lease = requestResources(req.headers).acquire(byteLength(data) * 3); // Buffer plus estimated decoded text/JSON working set.
+      let body;
+      try { body = isBinary ? null : JSON.parse(data.toString()); } catch { body = null; }
+      const modelCfg = claudeSlugs.get(body?.model);
+      if (body?.previous_response_id && (modelCfg || body.previous_response_id.startsWith('resp_ccb_'))) {
+        const previous = lastClaudeResponses.get(client);
+        if (previous?.id !== body.previous_response_id) { // Reconnects or GPT-owned parents need the client to replay its full context.
+          sendWebSocket(client, JSON.stringify({ type: 'error', status: 400, error: previousResponseError(body.previous_response_id) }), false);
+          return;
+        }
+        lease.grow(previous.bytes * 3);
+        body = { ...body, input: [...previous.input, ...(body.input || [])] };
+        delete body.previous_response_id;
+        data = JSON.stringify(body); // GPT switches must also send reconstructed history, not a bridge-owned response ID.
+        if (byteLength(data) > payloadCeiling) return closeOverloadedSocket(client);
+      }
+      const metadata = body?.client_metadata || {};
+      const frameHeaders = { ...req.headers, 'thread-id': metadata.thread_id || req.headers['thread-id'] };
+      if (!modelCfg) {
+        cancelAfterGptSwitch(requestThreadId(frameHeaders, body), body, 'websocket');
+        // GPT frame. Strip bridge-minted items first, exactly like the HTTP path in
+        // handle() does. Bug fixed 2026-09-24: this path used to forward frames
+        // untouched, so a GPT side chat forked from an Opus thread that Claude had
+        // compacted sent our `cmp_ccb_…` compaction marker to OpenAI, which failed
+        // with "The encrypted content for item cmp_ccb_… could not be verified".
+        // Clean frames (the normal case) are still forwarded byte-for-byte.
+        if (Array.isArray(body?.input)) {
+          const s = sanitizeInputForOpenAI(body.input);
+          if (s.changed) {
+            body.input = s.input;
+            return forwardGpt(JSON.stringify(body), false, body.model);
+          }
+        }
+        return forwardGpt(data, isBinary, body?.model);
+      }
+      const threadId = requestThreadId(frameHeaders, body);
+      let admission = null;
+      const onCompleted = (response) => {
+        if (admission) admission.turn = waitingCodexTurnsReferencedBy(response.output, threadId)[0] ?? null;
+        const contextBytes = byteLength(data) + Buffer.byteLength(JSON.stringify(response.output));
+        dropContext(client);
+        if (client.readyState !== WebSocket.OPEN || contextBytes > payloadCeiling) return;
+        try { contextLeases.set(client, resources.acquire(contextBytes * 2)); } catch { return; }
+        lastClaudeResponses.set(client, { id: response.id, bytes: contextBytes, input: [...(body.input || []), ...response.output] });
+        diagnostics.setContextBytes(client, contextBytes); // Bounded cache; an oversized history requires client replay.
+      };
+      if (body.generate === false) {
+        const stream = new ResponsesStream(new WebSocketResponse(client, onCompleted, (socket, data, binary) => sendWebSocket(socket, data, binary, { budget: lease.budget })), { model: body.model });
+        stream.begin();
+        stream.complete(usageObject());
         return;
       }
-      body = { ...body, input: [...previous.input, ...(body.input || [])] };
-      delete body.previous_response_id;
-      data = JSON.stringify(body); // GPT switches must also send reconstructed history, not a bridge-owned response ID.
-      if (byteLength(data) > limits.maxWebSocketPayloadBytes) return closeOverloadedSocket(client);
-    }
-    const metadata = body?.client_metadata || {};
-    const frameHeaders = { ...req.headers, 'thread-id': metadata.thread_id || req.headers['thread-id'] };
-    if (!modelCfg) {
-      cancelAfterGptSwitch(requestThreadId(frameHeaders, body), body, 'websocket');
-      // GPT frame. Strip bridge-minted items first, exactly like the HTTP path in
-      // handle() does. Bug fixed 2026-09-24: this path used to forward frames
-      // untouched, so a GPT side chat forked from an Opus thread that Claude had
-      // compacted sent our `cmp_ccb_…` compaction marker to OpenAI, which failed
-      // with "The encrypted content for item cmp_ccb_… could not be verified".
-      // Clean frames (the normal case) are still forwarded byte-for-byte.
-      if (Array.isArray(body?.input)) {
-        const s = sanitizeInputForOpenAI(body.input);
-        if (s.changed) {
-          body.input = s.input;
-          return forwardGpt(JSON.stringify(body), false, body.model);
+      if (!isAgentTurn(body)) {
+        body.model = fallbackGptModel(config, state);
+        if (body.reasoning?.effort && !['low', 'medium', 'high'].includes(body.reasoning.effort)) body.reasoning.effort = 'medium';
+        if (Array.isArray(body.input)) body.input = sanitizeInputForOpenAI(body.input).input;
+        return forwardGpt(JSON.stringify(body), false, body.model);
+      }
+      const turnReq = {
+        headers: {
+          ...frameHeaders,
+          'turn-id': metadata.turn_id || req.headers['turn-id'],
+        },
+      };
+      const hasCompactionTrigger = Array.isArray(body.input) && body.input.some((item) => item?.type === 'compaction_trigger');
+      const isContinuation = !hasCompactionTrigger && findCodexResults(body.input, threadId, providerForModel(modelCfg));
+      const rejectCapacity = () => {
+        sendWebSocket(client, JSON.stringify({ type: 'error', status: 503, error: { message: 'Bridge Claude turn capacity reached; retry after another turn completes.' } }), false);
+      };
+      const turnFailed = (error) => {
+        if (error instanceof RequestError && error.status === 503) return closeWebSocket(client, 1013, 'Bridge buffering capacity reached; retry later');
+        log.error(`Claude websocket turn crashed: ${error.stack || error}`);
+        if (client.readyState === WebSocket.OPEN) client.close(1011, 'Claude turn failed');
+      };
+      function startTurn() {
+        let finished;
+        if (admission) {
+          admission.turn = null;
+          admission.settled = false;
+          admission.finished = new Promise((resolve) => { finished = resolve; });
         }
+        const response = new WebSocketResponse(client, onCompleted, (socket, data, binary) => sendWebSocket(socket, data, binary, { budget: lease.budget }));
+        retained = true;
+        withResponseLease(response, lease, () => handleClaudeResponses(turnReq, response, { body, modelCfg, lease })).catch(turnFailed).finally(() => {
+          if (admission) admission.settled = true;
+          finished?.();
+          if (admission && !admission.replacing) activeWebSocketTurns.delete(admission);
+        });
       }
-      return forwardGpt(data, isBinary, body?.model);
-    }
-    const threadId = requestThreadId(frameHeaders, body);
-    let admission = null;
-    const onCompleted = (response) => {
-      if (admission) admission.turn = waitingCodexTurnsReferencedBy(response.output, threadId)[0] ?? null;
-      const contextBytes = byteLength(data) + Buffer.byteLength(JSON.stringify(response.output));
-      if (contextBytes > limits.maxWebSocketPayloadBytes) { lastClaudeResponses.delete(client); diagnostics.setContextBytes(client, 0); return; }
-      lastClaudeResponses.set(client, { id: response.id, input: [...(body.input || []), ...response.output] });
-      diagnostics.setContextBytes(client, contextBytes); // Bounded cache; an oversized history requires client replay.
-    };
-    if (body.generate === false) {
-      const stream = new ResponsesStream(new WebSocketResponse(client, onCompleted, sendWebSocket), { model: body.model });
-      stream.begin();
-      stream.complete(usageObject());
-      return;
-    }
-    if (!isAgentTurn(body)) {
-      body.model = fallbackGptModel(config, state);
-      if (body.reasoning?.effort && !['low', 'medium', 'high'].includes(body.reasoning.effort)) body.reasoning.effort = 'medium';
-      if (Array.isArray(body.input)) body.input = sanitizeInputForOpenAI(body.input).input;
-      return forwardGpt(JSON.stringify(body), false, body.model);
-    }
-    const turnReq = {
-      headers: {
-        ...frameHeaders,
-        'turn-id': metadata.turn_id || req.headers['turn-id'],
-      },
-    };
-    const hasCompactionTrigger = Array.isArray(body.input) && body.input.some((item) => item?.type === 'compaction_trigger');
-    const isContinuation = !hasCompactionTrigger && findCodexResults(body.input, threadId, providerForModel(modelCfg));
-    const rejectCapacity = () => {
-      sendWebSocket(client, JSON.stringify({ type: 'error', status: 503, error: { message: 'Bridge Claude turn capacity reached; retry after another turn completes.' } }), false);
-    };
-    const turnFailed = (error) => {
-      log.error(`Claude websocket turn crashed: ${error.stack || error}`);
-      if (client.readyState === WebSocket.OPEN) client.close(1011, 'Claude turn failed');
-    };
-    function startTurn() {
-      let finished;
-      if (admission) {
-        admission.turn = null;
-        admission.settled = false;
-        admission.finished = new Promise((resolve) => { finished = resolve; });
+      if (isContinuation) return startTurn();
+      if (pendingWebSocketReplacements.has(threadId)) return rejectCapacity();
+      if (activeWebSocketTurns.size >= limits.maxConcurrentRequests) {
+        const waiting = new Set(waitingCodexTurns(threadId));
+        admission = [...activeWebSocketTurns].find((slot) => slot.threadId === threadId && !slot.replacing && waiting.has(slot.turn));
+        if (!admission) return rejectCapacity();
+        admission.replacing = true;
+        pendingWebSocketReplacements.add(threadId);
+        retained = true;
+        cancelCodexTurns([admission.turn], hasCompactionTrigger ? 'compaction' : 'new-request')
+          .then(() => admission.finished) // Child exit precedes the original handler's cleanup; keep its slot through both.
+          .then(() => {
+            if (client.readyState !== WebSocket.OPEN) { activeWebSocketTurns.delete(admission); lease.release(); return; }
+            admission.replacing = false;
+            startTurn();
+          })
+          .catch((error) => {
+            admission.replacing = false;
+            if (admission.settled) activeWebSocketTurns.delete(admission);
+            lease.release();
+            turnFailed(error);
+          })
+          .finally(() => pendingWebSocketReplacements.delete(threadId));
+        return;
       }
-      const response = new WebSocketResponse(client, onCompleted, sendWebSocket);
-      handleClaudeResponses(turnReq, response, body, modelCfg).catch(turnFailed).finally(() => {
-        if (admission) admission.settled = true;
-        finished?.();
-        if (admission && !admission.replacing) activeWebSocketTurns.delete(admission);
-      });
-    }
-    if (isContinuation) return startTurn();
-    if (pendingWebSocketReplacements.has(threadId)) return rejectCapacity();
-    if (activeWebSocketTurns.size >= limits.maxConcurrentRequests) {
-      const waiting = new Set(waitingCodexTurns(threadId));
-      admission = [...activeWebSocketTurns].find((slot) => slot.threadId === threadId && !slot.replacing && waiting.has(slot.turn));
-      if (!admission) return rejectCapacity();
-      admission.replacing = true;
-      pendingWebSocketReplacements.add(threadId);
-      cancelCodexTurns([admission.turn], hasCompactionTrigger ? 'compaction' : 'new-request')
-        .then(() => admission.finished) // Child exit precedes the original handler's cleanup; keep its slot through both.
-        .then(() => {
-          if (client.readyState !== WebSocket.OPEN) { activeWebSocketTurns.delete(admission); return; }
-          admission.replacing = false;
-          startTurn();
-        })
-        .catch((error) => {
-          admission.replacing = false;
-          if (admission.settled) activeWebSocketTurns.delete(admission);
-          turnFailed(error);
-        })
-        .finally(() => pendingWebSocketReplacements.delete(threadId));
-      return;
-    }
-    admission = { threadId, turn: null, replacing: false };
-    activeWebSocketTurns.add(admission);
-    startTurn();
+      admission = { threadId, turn: null, replacing: false };
+      activeWebSocketTurns.add(admission);
+      startTurn();
+    } catch (error) {
+      if (error instanceof RequestError && error.status === 503) closeWebSocket(client, 1013, 'Bridge buffering capacity reached; retry later');
+      else { log.error(`WebSocket routing failed: ${error.message}`); client.close(1011, 'Bridge routing failed'); }
+    } finally { if (!retained) lease?.release(); }
   }
 
   let webSockets = 0;
@@ -527,7 +617,7 @@ export function createBridge(initialConfig, state = new State()) {
     if (!model || isClaude(model)) {
       // A fresh side chat can start with Claude, or omit the hint entirely.
       // Open GPT lazily if a frame on this socket needs it.
-      const wss = new WebSocketServer({ noServer: true, perMessageDeflate: true, maxPayload: limits.maxWebSocketPayloadBytes });
+      const wss = new WebSocketServer({ noServer: true, perMessageDeflate: true, maxPayload: payloadCeiling });
       wss.handleUpgrade(req, socket, head, (client) => {
         watchClientWebSocket(client);
         log.info(`local routed websocket model=${model || 'unhinted'}`);
@@ -536,8 +626,8 @@ export function createBridge(initialConfig, state = new State()) {
         let pendingBytes = 0;
         const forwardGpt = (data, isBinary, frameModel) => {
           if (client.readyState !== WebSocket.OPEN) return;
-          if (byteLength(data) > limits.maxWebSocketQueueBytes || pendingBytes + byteLength(data) > limits.maxWebSocketQueueBytes || pendingGpt.length >= limits.maxWebSocketQueueMessages) {
-            pendingGpt.length = 0;
+          if ((limits.maxWebSocketQueueBytes != null && pendingBytes + byteLength(data) > limits.maxWebSocketQueueBytes) || pendingGpt.length >= limits.maxWebSocketQueueMessages) {
+            for (const queued of pendingGpt.splice(0)) queued.lease.release();
             pendingBytes = 0;
             upstream?.terminate();
             return closeOverloadedSocket(client);
@@ -549,14 +639,14 @@ export function createBridge(initialConfig, state = new State()) {
             for (const key of Object.keys(headers)) {
               if (['host', 'connection', 'upgrade', 'sec-websocket-key', 'sec-websocket-version', 'sec-websocket-extensions'].includes(key)) delete headers[key];
             }
-            upstream = new WebSocket(target, { headers, perMessageDeflate: true, maxPayload: limits.maxWebSocketPayloadBytes, handshakeTimeout: 15000 });
+            upstream = new WebSocket(target, { headers, perMessageDeflate: true, maxPayload: payloadCeiling, handshakeTimeout: 15000 });
             diagnostics.trackSocket(upstream, 'upstream');
             upstream.on('open', () => {
-              for (const queued of pendingGpt.splice(0)) sendWebSocket(upstream, queued.data, queued.isBinary);
+              for (const queued of pendingGpt.splice(0)) sendWebSocket(upstream, queued.data, queued.isBinary, { reservation: queued.lease, source: client });
               pendingBytes = 0;
             });
             upstream.on('message', (message, binary) => {
-              sendWebSocket(client, message, binary);
+              sendWebSocket(client, message, binary, { source: upstream });
             });
             upstream.on('error', (error) => {
               log.error(`GPT websocket upstream failed: ${error.message}`);
@@ -564,11 +654,14 @@ export function createBridge(initialConfig, state = new State()) {
             });
             upstream.on('close', () => client.close());
           }
-          if (upstream.readyState === WebSocket.OPEN) sendWebSocket(upstream, data, isBinary);
-          else if (upstream.readyState === WebSocket.CONNECTING) { pendingGpt.push({ data, isBinary }); pendingBytes += byteLength(data); }
+          if (upstream.readyState === WebSocket.OPEN) sendWebSocket(upstream, data, isBinary, { source: client });
+          else if (upstream.readyState === WebSocket.CONNECTING) {
+            const queuedLease = resources.acquire(byteLength(data));
+            pendingGpt.push({ data, isBinary, lease: queuedLease }); pendingBytes += byteLength(data);
+          }
         };
         client.on('message', (data, isBinary) => routeWebSocketMessage(req, client, data, isBinary, forwardGpt));
-        client.on('close', () => { pendingGpt.length = 0; pendingBytes = 0; upstream?.terminate(); });
+        client.on('close', () => { for (const queued of pendingGpt.splice(0)) queued.lease.release(); pendingBytes = 0; upstream?.terminate(); });
       });
       return;
     }
@@ -580,13 +673,13 @@ export function createBridge(initialConfig, state = new State()) {
       if (['host', 'connection', 'upgrade', 'sec-websocket-key', 'sec-websocket-version', 'sec-websocket-extensions'].includes(key)) delete headers[key];
     }
     socket.pause();
-    const upstream = new WebSocket(target, { headers, perMessageDeflate: true, maxPayload: limits.maxWebSocketPayloadBytes, handshakeTimeout: 15000 });
+    const upstream = new WebSocket(target, { headers, perMessageDeflate: true, maxPayload: payloadCeiling, handshakeTimeout: 15000 });
     diagnostics.trackSocket(upstream, 'upstream');
     let upstreamResponse;
     let client;
     upstream.on('upgrade', (response) => { upstreamResponse = response; });
     upstream.on('open', () => {
-      const wss = new WebSocketServer({ noServer: true, perMessageDeflate: true, maxPayload: limits.maxWebSocketPayloadBytes });
+      const wss = new WebSocketServer({ noServer: true, perMessageDeflate: true, maxPayload: payloadCeiling });
       wss.on('headers', (responseHeaders) => {
         // Keep Codex's routing and capability headers; ws creates its own handshake headers.
         for (let i = 0; i < upstreamResponse.rawHeaders.length; i += 2) {
@@ -601,9 +694,9 @@ export function createBridge(initialConfig, state = new State()) {
         watchClientWebSocket(client);
         log.info(`proxied GPT websocket model=${model}`);
         socket.resume();
-        client.on('message', (data, isBinary) => routeWebSocketMessage(req, client, data, isBinary, (message, binary) => sendWebSocket(upstream, message, binary)));
+        client.on('message', (data, isBinary) => routeWebSocketMessage(req, client, data, isBinary, (message, binary) => sendWebSocket(upstream, message, binary, { source: client })));
         upstream.on('message', (data, isBinary) => {
-          sendWebSocket(client, data, isBinary);
+          sendWebSocket(client, data, isBinary, { source: upstream });
         });
         client.on('close', () => upstream.close());
         upstream.on('close', () => client.close());
@@ -621,7 +714,7 @@ export function createBridge(initialConfig, state = new State()) {
     socket.on('close', () => upstream.terminate());
   }
 
-  async function handle(req, res, inputProcessed) {
+  async function handle(req, res, inputProcessed, lease) {
     const denied = localOnly(req);
     if (denied) {
       res.writeHead(403);
@@ -654,14 +747,16 @@ export function createBridge(initialConfig, state = new State()) {
     if (req.method === 'GET' && subpath === '/models') return handleModels(req, res, subpath, query);
     if (req.method === 'GET' || req.method === 'HEAD') return passthrough(req, res, subpath, query, undefined);
 
-    const raw = await readBody(req, { maxBytes: limits.maxBodyBytes, timeoutMs: limits.bodyTimeoutMs });
+    const raw = await readBody(req, { maxBytes: limits.maxBodyBytes, timeoutMs: limits.bodyTimeoutMs, lease });
     if (res.destroyed) return;
     const encoding = req.headers['content-encoding'];
-    const decoded = await decodeBody(raw, encoding, limits.maxDecodedBytes);
+    const decoded = await decodeBody(raw, encoding, limits.maxDecodedBytes, { lease });
     if (res.destroyed) return;
     let body = null;
     const isJson = String(req.headers['content-type'] || '').includes('json');
     if (isJson) {
+      if (decoded.length > bufferConstants.MAX_STRING_LENGTH) throw new RequestError(503, 'Request exceeds this Node runtime’s JSON string capacity.');
+      lease.grow(decoded.length * 2); // Estimated UTF-16 text and parsed JSON; not a strict RSS measurement.
       try {
         body = JSON.parse(decoded.toString('utf8'));
       } catch (err) {
@@ -675,8 +770,9 @@ export function createBridge(initialConfig, state = new State()) {
     const modelCfg = claudeSlugs.get(body.model);
     if (subpath === '/responses' && modelCfg && isAgentTurn(body)) {
       try {
-        return await handleClaudeResponses(req, res, body, modelCfg);
+        return await handleClaudeResponses(req, res, { body, modelCfg, lease });
       } catch (err) {
+        if (err instanceof RequestError) throw err;
         log.error(`claude turn crashed: ${err.stack || err}`);
         if (!res.headersSent) {
           res.writeHead(500, { 'content-type': 'application/json' });
@@ -704,7 +800,10 @@ export function createBridge(initialConfig, state = new State()) {
         rewritten = true;
       }
     }
-    if (rewritten) return passthrough(req, res, subpath, query, JSON.stringify(body), { bodyRewritten: true });
+    if (rewritten) {
+      lease.grow(decoded.length * 2);
+      return passthrough(req, res, subpath, query, JSON.stringify(body), { bodyRewritten: true });
+    }
     return passthrough(req, res, subpath, query, raw);
   }
 
@@ -716,6 +815,7 @@ export function createBridge(initialConfig, state = new State()) {
     }
     activeRequests++;
     diagnostics.requestStarted();
+    const lease = requestResources(req.headers).acquire();
     let responseClosed = false;
     let processingFinished = false;
     let capacityReleased = false;
@@ -730,7 +830,7 @@ export function createBridge(initialConfig, state = new State()) {
       releaseCapacity();
     }
     res.once('close', () => { responseClosed = true; releaseCapacity(); });
-    handle(req, res, inputProcessed).catch((err) => {
+    withResponseLease(res, lease, () => handle(req, res, inputProcessed, lease)).catch((err) => {
       log.error(`request failed: ${err.stack || err}`);
       if (res.destroyed) return;
       if (!res.headersSent) res.writeHead(err instanceof RequestError ? err.status : 500, { 'content-type': 'application/json', connection: 'close' });
