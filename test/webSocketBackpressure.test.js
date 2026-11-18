@@ -17,6 +17,7 @@ process.env.CODEX_CLAUDE_BRIDGE_HOME = home;
 const { createBridge } = await import('../src/server.js');
 const { DEFAULTS } = await import('../src/config.js');
 const { State } = await import('../src/state.js');
+const { webSocketTransportBytes } = await import('../src/resourceBudget.js');
 
 test('hinted GPT response relay pauses upstream until the downstream send completes', { timeout: 10000 }, async (t) => {
   const upstream = http.createServer();
@@ -150,7 +151,7 @@ for (const hinted of [true, false]) {
     bridge = createBridge({
       ...DEFAULTS, localAuth, logLevel: 'error', codexComputerUseMcpConfig: null,
       claudePath: '/no-claude-must-be-started', upstream: upstreamUrl,
-      limits: { maxBufferedBytes: 4096 },
+      limits: { maxBufferedBytes: 4096 + 2 * webSocketTransportBytes, maxWebSocketPayloadBytes: 1024 },
     }, new State(path.join(directory, 'state.json')));
     bridge.server.on('connection', (socket) => {
       bridgeSockets.add(socket);

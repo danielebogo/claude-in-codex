@@ -20,7 +20,7 @@ import { diagnostics, diagnosticsSnapshot, logLifecycle, startResourceMonitor } 
 import { validateLocalAuth, authenticatedPath, healthProof } from './localAuth.js';
 import { DEFAULT_LIMITS, RequestError, readBody, decodeBody } from './requestLimits.js';
 import { createDebugDumper } from './debugDumps.js';
-import { ResourceBudget, webSocketResourceCeiling, withResponseLease } from './resourceBudget.js';
+import { ResourceBudget, webSocketResourceCeiling, webSocketTransportBytes, withResponseLease } from './resourceBudget.js';
 import { reserveContinuation } from './continuationBudget.js';
 
 export { decodeBody } from './requestLimits.js';
@@ -125,7 +125,7 @@ export function createBridge(initialConfig, state = new State()) {
   const auth = validateLocalAuth(config.localAuth);
   const limits = { ...DEFAULT_LIMITS, ...config.limits };
   for (const [name, value] of Object.entries(limits)) {
-    if (['maxBodyBytes', 'maxDecodedBytes', 'maxWebSocketPayloadBytes', 'maxWebSocketQueueBytes'].includes(name) && value == null) continue;
+    if (['maxBodyBytes', 'maxDecodedBytes', 'maxWebSocketPayloadBytes', 'maxWebSocketQueueBytes', 'maxWebSockets'].includes(name) && value == null) continue;
     if (!Number.isSafeInteger(value) || value < 1) throw new Error(`Bridge limit ${name} must be a positive safe integer.`);
   }
   const resources = new ResourceBudget(limits.maxBufferedBytes, { onPressure: (bytes) => {
@@ -396,8 +396,10 @@ export function createBridge(initialConfig, state = new State()) {
     return null;
   }
 
-  function rejectWebSocket(socket, status = '426 Upgrade Required') {
-    socket.end(`HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+  function rejectWebSocket(socket, status = '426 Upgrade Required', message = '') {
+    const body = message ? JSON.stringify({ error: { message } }) : '';
+    const headers = message ? 'Content-Type: application/json\r\n' : '';
+    socket.end(`HTTP/1.1 ${status}\r\nConnection: close\r\n${headers}Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
   }
 
   function dropContext(client) {
@@ -593,6 +595,32 @@ export function createBridge(initialConfig, state = new State()) {
     } finally { if (!retained) lease?.release(); }
   }
 
+  // Failure modes: resource pressure before construction, failed/stalled upgrades,
+  // and client disconnects. Keep the base lease until the actual transport closes.
+  function openUpstreamWebSocket(target, headers) {
+    const lease = resources.acquire(webSocketTransportBytes);
+    let transportAssigned = false;
+    try {
+      const upstream = new WebSocket(target, {
+        headers, perMessageDeflate: true, maxPayload: payloadCeiling, handshakeTimeout: 15000,
+        finishRequest(request) {
+          request.once('socket', (transport) => {
+            transportAssigned = true;
+            transport.once('close', () => lease.release());
+          });
+          request.end();
+        },
+      });
+      upstream.once('close', () => {
+        if (!transportAssigned) lease.release();
+      });
+      return upstream;
+    } catch (error) {
+      lease.release();
+      throw error;
+    }
+  }
+
   let webSockets = 0;
   function proxyWebSocket(req, socket, head) {
     socket.on('error', (error) => {
@@ -606,9 +634,15 @@ export function createBridge(initialConfig, state = new State()) {
     if (pathname === null) return rejectWebSocket(socket, '401 Unauthorized');
     if (pathname !== `${BASE_PATH}/responses`) return rejectWebSocket(socket, '404 Not Found');
     refreshModels();
-    if (webSockets >= limits.maxWebSockets) return rejectWebSocket(socket, '503 Service Unavailable');
+    if (limits.maxWebSockets != null && webSockets >= limits.maxWebSockets) {
+      return rejectWebSocket(socket, '503 Service Unavailable', 'Bridge connection capacity reached; retry after a connection closes or adjust limits.maxWebSockets.');
+    }
+    let transportLease;
+    // Idle transports have no validated tool result and cannot borrow continuation credit.
+    try { transportLease = resources.acquire(webSocketTransportBytes); }
+    catch (error) { return rejectWebSocket(socket, '503 Service Unavailable', error.message); }
     webSockets++;
-    socket.once('close', () => { webSockets--; });
+    socket.once('close', () => { webSockets--; transportLease.release(); });
 
     // Some Codex clients omit the model hint, even in current prewarm requests.
     // Accept the socket and route its frames by model instead of making those
@@ -639,7 +673,7 @@ export function createBridge(initialConfig, state = new State()) {
             for (const key of Object.keys(headers)) {
               if (['host', 'connection', 'upgrade', 'sec-websocket-key', 'sec-websocket-version', 'sec-websocket-extensions'].includes(key)) delete headers[key];
             }
-            upstream = new WebSocket(target, { headers, perMessageDeflate: true, maxPayload: payloadCeiling, handshakeTimeout: 15000 });
+            upstream = openUpstreamWebSocket(target, headers);
             diagnostics.trackSocket(upstream, 'upstream');
             upstream.on('open', () => {
               for (const queued of pendingGpt.splice(0)) sendWebSocket(upstream, queued.data, queued.isBinary, { reservation: queued.lease, source: client });
@@ -672,13 +706,30 @@ export function createBridge(initialConfig, state = new State()) {
     for (const key of Object.keys(headers)) {
       if (['host', 'connection', 'upgrade', 'sec-websocket-key', 'sec-websocket-version', 'sec-websocket-extensions'].includes(key)) delete headers[key];
     }
+    let upstream;
+    try { upstream = openUpstreamWebSocket(target, headers); }
+    catch (error) {
+      const status = error instanceof RequestError ? '503 Service Unavailable' : '502 Bad Gateway';
+      return rejectWebSocket(socket, status, error instanceof RequestError ? error.message : 'Could not open the upstream WebSocket.');
+    }
     socket.pause();
-    const upstream = new WebSocket(target, { headers, perMessageDeflate: true, maxPayload: payloadCeiling, handshakeTimeout: 15000 });
+    // A paused prewarm must still notice EOF while the upstream upgrade waits.
+    // read(0) observes an empty EOF without consuming an early WebSocket frame.
+    const observeEnd = () => { if (socket.readableLength === 0) socket.read(0); };
+    const abortUpgrade = () => socket.destroy();
+    const stopObservingEnd = () => {
+      socket.off('readable', observeEnd);
+      socket.off('end', abortUpgrade);
+    };
+    socket.on('readable', observeEnd);
+    socket.once('end', abortUpgrade);
+    socket.once('close', stopObservingEnd);
     diagnostics.trackSocket(upstream, 'upstream');
     let upstreamResponse;
     let client;
     upstream.on('upgrade', (response) => { upstreamResponse = response; });
     upstream.on('open', () => {
+      stopObservingEnd();
       const wss = new WebSocketServer({ noServer: true, perMessageDeflate: true, maxPayload: payloadCeiling });
       wss.on('headers', (responseHeaders) => {
         // Keep Codex's routing and capability headers; ws creates its own handshake headers.
@@ -703,13 +754,20 @@ export function createBridge(initialConfig, state = new State()) {
       });
     });
     upstream.on('unexpected-response', (_request, response) => {
+      stopObservingEnd();
       response.resume();
+      socket.resume();
       rejectWebSocket(socket, `${response.statusCode} ${response.statusMessage}`);
+      upstream.terminate(); // An unexpected-response listener takes ownership of aborting the failed upgrade.
     });
     upstream.on('error', (error) => {
       log.error(`GPT websocket upstream failed: ${error.message}`);
       if (client) client.close(1011, 'Upstream WebSocket failed');
-      else if (!socket.destroyed) rejectWebSocket(socket, '502 Bad Gateway');
+      else if (!socket.destroyed && !socket.writableEnded) {
+        stopObservingEnd();
+        socket.resume();
+        rejectWebSocket(socket, '502 Bad Gateway');
+      }
     });
     socket.on('close', () => upstream.terminate());
   }

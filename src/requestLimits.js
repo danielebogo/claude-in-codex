@@ -14,7 +14,7 @@ export const DEFAULT_LIMITS = Object.freeze({
   bodyTimeoutMs: 30000,
   maxConcurrentRequests: 32,
   maxWebSocketQueueMessages: 64,
-  maxWebSockets: 64,
+  maxWebSockets: null,
 });
 
 // Failure modes: explicit byte caps, exhausted shared memory budget, stalled or

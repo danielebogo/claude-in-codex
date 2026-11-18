@@ -1,6 +1,6 @@
 // Failure modes:
 // - An admitted native tool handoff consumes the memory needed for its result.
-// - Another thread borrows continuation credit reserved for the waiting process.
+// - Another thread or headerless prewarm borrows reserved continuation credit.
 // - A completed native turn retains its input or unused continuation reservation.
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -24,6 +24,7 @@ after(() => {
 const { createBridge } = await import('../src/server.js');
 const { DEFAULTS } = await import('../src/config.js');
 const { State } = await import('../src/state.js');
+const { webSocketTransportBytes } = await import('../src/resourceBudget.js');
 const { cancelWaitingCodexTurns } = await import('../src/codexTools.js');
 
 function message(text) {
@@ -51,9 +52,11 @@ for (const protocol of ['HTTP', 'WebSocket']) {
     const sockets = new Set();
     let bridge;
     let socket;
+    const prewarms = [];
     t.after(async () => {
       await cancelWaitingCodexTurns(thread);
       socket?.terminate();
+      for (const prewarm of prewarms) prewarm.terminate();
       for (const connection of sockets) connection.destroy();
       bridge?.server.closeAllConnections();
       upstream.closeAllConnections();
@@ -73,7 +76,7 @@ for (const protocol of ['HTTP', 'WebSocket']) {
       ...DEFAULTS, localAuth, logLevel: 'error', codexComputerUseMcpConfig: null,
       claudePath: new URL('./fixtures/fake-claude.js', import.meta.url).pathname,
       upstream: `http://127.0.0.1:${upstream.address().port}/backend-api/codex`,
-      limits: { maxBufferedBytes: 192 * 1024 },
+      limits: { maxBufferedBytes: 192 * 1024 + (protocol === 'WebSocket' ? webSocketTransportBytes : 0) },
     }, new State(path.join(directory, 'state.json')));
     bridge.server.on('connection', (connection) => {
       sockets.add(connection);
@@ -142,6 +145,24 @@ for (const protocol of ['HTTP', 'WebSocket']) {
     await rejected.arrayBuffer();
     assert.equal(requests.length, 0);
 
+    // Headerless prewarms must use unreserved global capacity while this native
+    // process is waiting; keep any incorrectly admitted sockets open through resume.
+    const prewarmStatuses = [];
+    for (let index = 0; index < 2; index++) {
+      const prewarm = new WebSocket(url.replace('http:', 'ws:'));
+      prewarms.push(prewarm);
+      prewarm.on('error', () => {});
+      prewarmStatuses.push(await new Promise((resolve) => {
+        prewarm.once('open', () => resolve(101));
+        prewarm.once('unexpected-response', (_request, response) => {
+          response.resume();
+          prewarm.terminate();
+          resolve(response.statusCode);
+        });
+        prewarm.once('error', () => resolve(0));
+      }));
+    }
+
     const continued = await turn({
       ...body,
       input: [...input, ...first.response.output, { type: 'function_call_output', call_id: call.call_id, output: 'reserved continuation succeeded' }],
@@ -153,6 +174,7 @@ for (const protocol of ['HTTP', 'WebSocket']) {
     const after = fs.readFileSync(log, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
     assert.equal(after.length, 1, 'Continuation must resume the original process rather than spawn another.');
     assert.equal(after[0].pid, before[0].pid);
+    assert.deepEqual(prewarmStatuses, [503, 503], 'Prewarms cannot borrow native continuation credit.');
     // Completion can precede the native handler's final cleanup by one event-loop turn.
     let recovered;
     const deadline = Date.now() + 1500;

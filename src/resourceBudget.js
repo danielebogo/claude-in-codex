@@ -8,7 +8,12 @@ export function defaultBufferBudget({ heapBytes = v8.getHeapStatistics().heap_si
   return Math.max(1, Math.floor(Math.min(heapBytes / 4, memoryBytes / 8, constrainedBytes / 8)));
 }
 
-/** Shared admission for retained input, parse estimates, context and send queues. */
+/** Conservative base admission per client/upstream transport, separate from payloads.
+ * This estimates socket, TLS and ws bookkeeping; it is not a measured RSS cap.
+ */
+export const webSocketTransportBytes = 64 * 1024;
+
+/** Shared admission for transports, retained input, parse estimates and send queues. */
 export class ResourceBudget {
   constructor(capacity = defaultBufferBudget(), { onGrow = () => {}, onRelease = () => {}, onPressure = () => {} } = {}) {
     if (!Number.isSafeInteger(capacity) || capacity < 1) throw new Error('maxBufferedBytes must be a positive safe integer.');

@@ -24,7 +24,7 @@ test('RequestError preserves HTTP status and default limits are explicit', () =>
   assert.ok(error instanceof Error);
   assert.equal(error.status, 413);
   assert.equal(error.message, 'Too large');
-  for (const key of ['maxBodyBytes', 'maxDecodedBytes', 'maxWebSocketPayloadBytes', 'maxWebSocketQueueBytes']) assert.equal(DEFAULT_LIMITS[key], null);
+  for (const key of ['maxBodyBytes', 'maxDecodedBytes', 'maxWebSocketPayloadBytes', 'maxWebSocketQueueBytes', 'maxWebSockets']) assert.equal(DEFAULT_LIMITS[key], null);
   assert.ok(Number.isSafeInteger(DEFAULT_LIMITS.maxBufferedBytes) && DEFAULT_LIMITS.maxBufferedBytes > 0);
 });
 
